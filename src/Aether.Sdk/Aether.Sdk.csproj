@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFrameworks>netstandard2.0;net8.0</TargetFrameworks>
+    <LangVersion>12.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <RootNamespace>Aether.Sdk</RootNamespace>
+    <AssemblyName>Aether.Sdk</AssemblyName>
+
+    <!-- NuGet package metadata.
+         Package ID is `AetherDb.Sdk`: the `Aether.*` prefix on NuGet.org is
+         reserved by another account, and we own the `aetherdb.ai` brand. The
+         in-source assembly + namespace stay `Aether.Sdk`, so consumers
+         install `AetherDb.Sdk` but write `using Aether.Sdk;`. -->
+    <PackageId>AetherDb.Sdk</PackageId>
+    <Version>0.1.0</Version>
+    <Authors>Aether Contributors</Authors>
+    <Description>.NET SDK for the Aether decentralized RAG API</Description>
+    <PackageLicenseExpression>MIT</PackageLicenseExpression>
+    <PackageProjectUrl>https://github.com/quintessence-group/aether-sdk-dotnet</PackageProjectUrl>
+    <RepositoryUrl>https://github.com/quintessence-group/aether-sdk-dotnet.git</RepositoryUrl>
+    <RepositoryType>git</RepositoryType>
+    <PackageTags>aether;rag;decentralized;sdk;ai;vector-search</PackageTags>
+    <PackageReadmeFile>README.md</PackageReadmeFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <InternalsVisibleTo Include="Aether.Sdk.Tests" />
+  </ItemGroup>
+
+  <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="../../README.md" Pack="true" PackagePath="/" />
+  </ItemGroup>
+
+</Project>
