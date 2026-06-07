@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Headers;
+using System.Runtime.InteropServices;
 using System.Text;
 using System.Text.Json;
 
@@ -15,6 +16,9 @@ public class AetherClient : IDisposable
     private readonly int _maxRetries;
     private readonly TimeSpan _retryBaseDelay;
     private bool _disposed;
+
+    /// <summary>SDK version, reported in the User-Agent header. Keep in sync with the csproj &lt;Version&gt;.</summary>
+    private const string Version = "0.1.0";
 
     private static readonly HashSet<HttpStatusCode> RetryableStatusCodes = new()
     {
@@ -77,12 +81,42 @@ public class AetherClient : IDisposable
         _maxRetries = Math.Max(0, options.MaxRetries);
         _retryBaseDelay = options.RetryBaseDelay;
 
+        EnforceSecureBaseUrl(_baseUrl, options.ApiKey);
+
         _http = new HttpClient { Timeout = options.Timeout };
+        ConfigureUserAgent(_http);
 
         if (!string.IsNullOrEmpty(options.ApiKey))
         {
             _http.DefaultRequestHeaders.Authorization =
                 new AuthenticationHeaderValue("Bearer", options.ApiKey);
+        }
+    }
+
+    /// <summary>Adds the SDK User-Agent so the server can attribute traffic by SDK + version.</summary>
+    private static void ConfigureUserAgent(HttpClient http)
+    {
+        http.DefaultRequestHeaders.UserAgent.Add(
+            new ProductInfoHeaderValue("aether-sdk-dotnet", Version));
+        http.DefaultRequestHeaders.UserAgent.Add(
+            new ProductInfoHeaderValue($"({RuntimeInformation.FrameworkDescription})"));
+    }
+
+    /// <summary>
+    /// Throws if an API key would be sent over cleartext HTTP to a non-loopback
+    /// host. Loopback addresses (localhost, 127.0.0.0/8, ::1) are allowed so
+    /// local development against a non-TLS node still works.
+    /// </summary>
+    private static void EnforceSecureBaseUrl(string baseUrl, string? apiKey)
+    {
+        if (string.IsNullOrEmpty(apiKey))
+            return;
+        if (Uri.TryCreate(baseUrl, UriKind.Absolute, out var uri)
+            && uri.Scheme == Uri.UriSchemeHttp && !uri.IsLoopback)
+        {
+            throw new AetherException(
+                $"Refusing to send API key over insecure HTTP to '{uri.Host}'. " +
+                "Use an https:// base URL, or omit the API key for local non-TLS endpoints.");
         }
     }
 
@@ -96,6 +130,7 @@ public class AetherClient : IDisposable
         _baseUrl = baseUrl.TrimEnd('/');
         _maxRetries = 2;
         _retryBaseDelay = TimeSpan.FromSeconds(0.5);
+        ConfigureUserAgent(_http);
     }
 
     // ── Internal helpers ──────────────────────────────────────────────
@@ -188,6 +223,10 @@ public class AetherClient : IDisposable
 #endif
             ).ConfigureAwait(false);
 
+        // Mint one idempotency key per logical write, reused across retries so
+        // the server can deduplicate a request whose response was lost in transit.
+        string? idempotencyKey = method == HttpMethod.Post ? Guid.NewGuid().ToString() : null;
+
         HttpResponseMessage response;
         try
         {
@@ -196,6 +235,8 @@ public class AetherClient : IDisposable
                 var msg = new HttpRequestMessage(method, url);
                 if (contentBytes != null)
                     msg.Content = new ByteArrayContent(contentBytes);
+                if (idempotencyKey != null)
+                    msg.Headers.Add("Idempotency-Key", idempotencyKey);
                 return msg;
             }, cancellationToken).ConfigureAwait(false);
         }
@@ -251,11 +292,19 @@ public class AetherClient : IDisposable
     {
         var url = $"{_baseUrl}{path}";
 
+        string? idempotencyKey = method == HttpMethod.Post ? Guid.NewGuid().ToString() : null;
+
         HttpResponseMessage response;
         try
         {
             response = await SendWithRetryAsync(
-                () => new HttpRequestMessage(method, url),
+                () =>
+                {
+                    var msg = new HttpRequestMessage(method, url);
+                    if (idempotencyKey != null)
+                        msg.Headers.Add("Idempotency-Key", idempotencyKey);
+                    return msg;
+                },
                 cancellationToken).ConfigureAwait(false);
         }
         catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
@@ -418,6 +467,7 @@ public class AetherClient : IDisposable
             {
                 Content = new StreamContent(stream),
             };
+            request.Headers.Add("Idempotency-Key", Guid.NewGuid().ToString());
             response = await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
         }
         catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
