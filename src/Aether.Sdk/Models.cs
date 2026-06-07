@@ -182,6 +182,15 @@ public class BatchSearchQuery
 
     [JsonPropertyName("include_content")]
     public bool IncludeContent { get; set; }
+
+    /// <summary>
+    /// Optional cosine-distance ceiling. Results with
+    /// <c>distance &gt; MaxDistance</c> are dropped server-side, after
+    /// reranking. Leave null to return the top-k regardless of distance.
+    /// </summary>
+    [JsonPropertyName("max_distance")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? MaxDistance { get; set; }
 }
 
 /// <summary>Results for a single query in a batch search.</summary>
@@ -279,6 +288,10 @@ internal class VectorSearchRequest
 
     [JsonPropertyName("tags")]
     public List<string>? Tags { get; set; }
+
+    [JsonPropertyName("max_distance")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? MaxDistance { get; set; }
 }
 
 internal class BatchInsertRequest
