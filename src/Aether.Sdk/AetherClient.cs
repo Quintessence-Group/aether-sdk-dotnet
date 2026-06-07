@@ -609,10 +609,22 @@ public class AetherClient : IDisposable
     // ── Search ────────────────────────────────────────────────────────
 
     /// <summary>Similarity search across documents.</summary>
+    /// <param name="query">Natural language search query.</param>
+    /// <param name="k">Maximum number of results to return. Default: 10.</param>
+    /// <param name="tags">Optional tags to filter results.</param>
+    /// <param name="maxDistance">
+    /// Optional cosine-distance ceiling. Results with
+    /// <c>distance &gt; maxDistance</c> are dropped server-side, after reranking.
+    /// Smaller is stricter (0.0 = exact match, ~1.0 = unrelated). Pass
+    /// <c>null</c> to return the top-k regardless of distance — the historical
+    /// behavior.
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token.</param>
     public async Task<List<SearchResult>> SearchAsync(
         string query,
         int k = 10,
         IReadOnlyList<string>? tags = null,
+        float? maxDistance = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(query))
@@ -622,6 +634,8 @@ public class AetherClient : IDisposable
         var qs = $"q={Uri.EscapeDataString(query)}&k={k}";
         if (tags is { Count: > 0 })
             qs += $"&tags={Uri.EscapeDataString(string.Join(",", tags))}";
+        if (maxDistance.HasValue)
+            qs += $"&max_distance={maxDistance.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
         var response = await RequestAsync<SearchResponse>(
             $"/search?{qs}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
         return response.Results;
@@ -632,11 +646,16 @@ public class AetherClient : IDisposable
     /// <param name="query">Natural language search query.</param>
     /// <param name="k">Maximum number of results to return. Default: 5.</param>
     /// <param name="tags">Optional tags to filter results.</param>
+    /// <param name="maxDistance">
+    /// Optional cosine-distance ceiling. See <see cref="SearchAsync"/> for
+    /// semantics.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public async Task<List<RetrievalResult>> RetrieveAsync(
         string query,
         int k = 5,
         IReadOnlyList<string>? tags = null,
+        float? maxDistance = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(query))
@@ -646,6 +665,8 @@ public class AetherClient : IDisposable
         var qs = $"q={Uri.EscapeDataString(query)}&k={k}&include_content=true";
         if (tags is { Count: > 0 })
             qs += $"&tags={Uri.EscapeDataString(string.Join(",", tags))}";
+        if (maxDistance.HasValue)
+            qs += $"&max_distance={maxDistance.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
         var response = await RequestAsync<SearchResponse>(
             $"/search?{qs}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
 
@@ -697,12 +718,17 @@ public class AetherClient : IDisposable
     /// <param name="k">Maximum number of results to return. Default: 10.</param>
     /// <param name="includeContent">Whether to include document content in results. Default: false.</param>
     /// <param name="tags">Optional tags to filter results.</param>
+    /// <param name="maxDistance">
+    /// Optional cosine-distance ceiling. See <see cref="SearchAsync"/> for
+    /// semantics.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public async Task<List<SearchResult>> SearchByVectorAsync(
         float[] embedding,
         int k = 10,
         bool includeContent = false,
         IReadOnlyList<string>? tags = null,
+        float? maxDistance = null,
         CancellationToken cancellationToken = default)
     {
         if (embedding is null || embedding.Length == 0)
@@ -715,6 +741,7 @@ public class AetherClient : IDisposable
             K = k,
             IncludeContent = includeContent,
             Tags = tags is { Count: > 0 } ? new List<string>(tags) : null,
+            MaxDistance = maxDistance,
         };
         var json = JsonSerializer.Serialize(body, JsonOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
