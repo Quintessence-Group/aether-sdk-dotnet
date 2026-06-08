@@ -56,6 +56,14 @@ public class AetherClient : IDisposable
         return ext != null && ExtensionMimeMap.TryGetValue(ext, out var mime) ? mime : "application/octet-stream";
     }
 
+    /// <summary>
+    /// Joins tags into the comma-separated string the API expects on the wire.
+    /// Mirrors the query-string and single-insert tag encoding; returns null when
+    /// there are no tags so the field can be omitted from the JSON body.
+    /// </summary>
+    private static string? JoinTags(IReadOnlyList<string>? tags)
+        => tags is { Count: > 0 } ? string.Join(",", tags) : null;
+
     private static string BuildQueryString(
         string baseQuery,
         IReadOnlyList<string>? tags = null,
@@ -215,13 +223,20 @@ public class AetherClient : IDisposable
         var url = $"{_baseUrl}{path}";
 
         // Capture content bytes up front so the factory can recreate the request
+        // on each (re)try. Also capture the original Content-Type: ByteArrayContent
+        // defaults to no Content-Type, so without this the server rejects the
+        // rebuilt body with 415 Unsupported Media Type on every attempt.
         byte[]? contentBytes = null;
+        MediaTypeHeaderValue? contentType = null;
         if (content != null)
+        {
             contentBytes = await content.ReadAsByteArrayAsync(
 #if NET8_0_OR_GREATER
                 cancellationToken
 #endif
             ).ConfigureAwait(false);
+            contentType = content.Headers.ContentType;
+        }
 
         // Mint one idempotency key per logical write, reused across retries so
         // the server can deduplicate a request whose response was lost in transit.
@@ -234,7 +249,14 @@ public class AetherClient : IDisposable
             {
                 var msg = new HttpRequestMessage(method, url);
                 if (contentBytes != null)
-                    msg.Content = new ByteArrayContent(contentBytes);
+                {
+                    var rebuilt = new ByteArrayContent(contentBytes);
+                    // Preserve the original Content-Type on every attempt so JSON
+                    // POST bodies keep their `application/json` media type.
+                    if (contentType != null)
+                        rebuilt.Headers.ContentType = contentType;
+                    msg.Content = rebuilt;
+                }
                 if (idempotencyKey != null)
                     msg.Headers.Add("Idempotency-Key", idempotencyKey);
                 return msg;
@@ -820,7 +842,17 @@ public class AetherClient : IDisposable
             throw new ArgumentOutOfRangeException(nameof(chunking), "ChunkSize must be non-negative");
         if (chunking?.Overlap < 0)
             throw new ArgumentOutOfRangeException(nameof(chunking), "Overlap must be non-negative");
-        var request = new BatchInsertRequest { Documents = documents };
+        var request = new BatchInsertRequest
+        {
+            // Map to the wire shape, joining each item's tags into a comma string
+            // (the prod batch deserializer rejects a JSON array with 422).
+            Documents = documents.ConvertAll(d => new BatchInsertWireItem
+            {
+                Filename = d.Filename,
+                Content = d.Content,
+                Tags = JoinTags(d.Tags),
+            }),
+        };
         if (chunking?.ChunkSize > 0)
             request.ChunkSize = chunking.ChunkSize;
         if (chunking?.Overlap > 0)
@@ -840,7 +872,19 @@ public class AetherClient : IDisposable
     {
         if (queries is null || queries.Count == 0)
             throw new ArgumentException("queries cannot be null or empty", nameof(queries));
-        var request = new BatchSearchRequest { Queries = queries };
+        var request = new BatchSearchRequest
+        {
+            // Map to the wire shape, joining each query's tags into a comma string
+            // for consistency with the batch insert path and the rest of the API.
+            Queries = queries.ConvertAll(q => new BatchSearchWireQuery
+            {
+                Q = q.Q,
+                K = q.K,
+                Tags = JoinTags(q.Tags),
+                IncludeContent = q.IncludeContent,
+                MaxDistance = q.MaxDistance,
+            }),
+        };
         var json = JsonSerializer.Serialize(request, JsonOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         var response = await RequestAsync<BatchSearchResponseWrapper>(

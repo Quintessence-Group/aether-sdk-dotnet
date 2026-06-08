@@ -86,6 +86,37 @@ public class HardeningTests
     }
 
     [Fact]
+    public async Task JsonPostSetsContentTypeOnFirstAttempt()
+    {
+        var handler = new RecordingHandler(HttpStatusCode.OK);
+        var client = new AetherClient(new HttpClient(handler), "http://localhost:9000");
+        await client.InsertWithEmbeddingsAsync(new InsertWithEmbeddingsRequest { Content = "hi" });
+
+        Assert.Single(handler.Requests);
+        Assert.Equal("application/json", handler.Requests[0].Content?.Headers.ContentType?.MediaType);
+    }
+
+    [Fact]
+    public async Task JsonPostKeepsContentTypeAcrossRetries()
+    {
+        // First attempt 503 (retryable), second 200. The body is buffered and the
+        // request rebuilt as ByteArrayContent on retry — it must still carry
+        // Content-Type: application/json, or prod returns 415 on the retry.
+        var handler = new RecordingHandler(HttpStatusCode.ServiceUnavailable, HttpStatusCode.OK)
+        {
+            ResponseBody = new { results = Array.Empty<object>() },
+        };
+        var client = new AetherClient(new HttpClient(handler), "http://localhost:9000");
+        await client.SearchByVectorAsync(new[] { 0.1f, 0.2f, 0.3f });
+
+        Assert.Equal(2, handler.Requests.Count);
+        foreach (var req in handler.Requests)
+        {
+            Assert.Equal("application/json", req.Content?.Headers.ContentType?.MediaType);
+        }
+    }
+
+    [Fact]
     public void HttpWithKeyToRemoteHostThrows()
     {
         Assert.Throws<AetherException>(() =>

@@ -297,13 +297,53 @@ internal class VectorSearchRequest
 internal class BatchInsertRequest
 {
     [JsonPropertyName("documents")]
-    public List<BatchInsertItem> Documents { get; set; } = new();
+    public List<BatchInsertWireItem> Documents { get; set; } = new();
 
     [JsonPropertyName("chunk_size")]
     public int? ChunkSize { get; set; }
 
     [JsonPropertyName("overlap")]
     public int? Overlap { get; set; }
+}
+
+/// <summary>
+/// Wire shape for a batch insert document. The prod batch deserializer expects
+/// <c>tags</c> as a comma-joined string (matching every other endpoint), not a
+/// JSON array — sending an array yields HTTP 422. We serialize the public
+/// <see cref="BatchInsertItem.Tags"/> list down to a comma string here.
+/// </summary>
+internal class BatchInsertWireItem
+{
+    [JsonPropertyName("filename")]
+    public string Filename { get; set; } = "";
+
+    [JsonPropertyName("content")]
+    public string Content { get; set; } = "";
+
+    [JsonPropertyName("tags")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Tags { get; set; }
+}
+
+/// <summary>Wire shape for a batch search query; <c>tags</c> is a comma-joined string.</summary>
+internal class BatchSearchWireQuery
+{
+    [JsonPropertyName("q")]
+    public string Q { get; set; } = "";
+
+    [JsonPropertyName("k")]
+    public int K { get; set; } = 10;
+
+    [JsonPropertyName("tags")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Tags { get; set; }
+
+    [JsonPropertyName("include_content")]
+    public bool IncludeContent { get; set; }
+
+    [JsonPropertyName("max_distance")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public float? MaxDistance { get; set; }
 }
 
 internal class BatchInsertResponse
@@ -315,7 +355,7 @@ internal class BatchInsertResponse
 internal class BatchSearchRequest
 {
     [JsonPropertyName("queries")]
-    public List<BatchSearchQuery> Queries { get; set; } = new();
+    public List<BatchSearchWireQuery> Queries { get; set; } = new();
 }
 
 internal class BatchSearchResponseWrapper
