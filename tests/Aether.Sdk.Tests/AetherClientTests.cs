@@ -504,6 +504,101 @@ public class AetherClientTests
     }
 
     [Fact]
+    public async Task BatchInsertAsync_SendsTagsAsCommaJoinedString()
+    {
+        // Capture the request body up front: the handler buffers content into a
+        // rebuilt ByteArrayContent, but we read it synchronously to be safe.
+        string? capturedBody = null;
+        var handler = new MockHttpMessageHandler(req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1 } },
+                    }),
+                    Encoding.UTF8, "application/json"),
+            };
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchInsertAsync(new List<BatchInsertItem>
+        {
+            new() { Filename = "a.txt", Content = "hello", Tags = new List<string> { "x", "y" } },
+        });
+
+        Assert.NotNull(capturedBody);
+        using var doc = JsonDocument.Parse(capturedBody!);
+        var tags = doc.RootElement.GetProperty("documents")[0].GetProperty("tags");
+        // Must be a comma-joined STRING, not a JSON array (prod rejects the array with 422).
+        Assert.Equal(JsonValueKind.String, tags.ValueKind);
+        Assert.Equal("x,y", tags.GetString());
+    }
+
+    [Fact]
+    public async Task BatchInsertAsync_OmitsTagsWhenNone()
+    {
+        string? capturedBody = null;
+        var handler = new MockHttpMessageHandler(req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1 } },
+                    }),
+                    Encoding.UTF8, "application/json"),
+            };
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchInsertAsync(new List<BatchInsertItem>
+        {
+            new() { Filename = "a.txt", Content = "hello" },
+        });
+
+        Assert.NotNull(capturedBody);
+        using var doc = JsonDocument.Parse(capturedBody!);
+        var item = doc.RootElement.GetProperty("documents")[0];
+        Assert.False(item.TryGetProperty("tags", out _));
+    }
+
+    [Fact]
+    public async Task BatchSearchAsync_SendsTagsAsCommaJoinedString()
+    {
+        string? capturedBody = null;
+        var handler = new MockHttpMessageHandler(req =>
+        {
+            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    JsonSerializer.Serialize(new
+                    {
+                        results = new[] { new { query = "test", results = Array.Empty<object>() } },
+                    }),
+                    Encoding.UTF8, "application/json"),
+            };
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "test", K = 5, Tags = new List<string> { "alpha", "beta" } },
+        });
+
+        Assert.NotNull(capturedBody);
+        using var doc = JsonDocument.Parse(capturedBody!);
+        var tags = doc.RootElement.GetProperty("queries")[0].GetProperty("tags");
+        Assert.Equal(JsonValueKind.String, tags.ValueKind);
+        Assert.Equal("alpha,beta", tags.GetString());
+    }
+
+    [Fact]
     public async Task BatchSearchAsync_SendsCorrectRequest()
     {
         var handler = MockHttpMessageHandler.WithJson(new
