@@ -8,7 +8,7 @@ name: Release
 #
 # Matches the nuget.org "deploy" trusted-publishing policy:
 #   owner: aether-ai · repo: Quintessence-Group/aether-sdk-dotnet
-#   workflow: release.yml · environment: production
+#   workflow: release.yml · environment: prod
 #
 # Requires one repo secret:
 #   NUGET_USER = your nuget.org username (profile name, NOT an email address)
@@ -26,7 +26,7 @@ jobs:
   publish:
     name: Build, test & publish to NuGet
     runs-on: ubuntu-latest
-    environment: production
+    environment: prod
     permissions:
       contents: read
       id-token: write # required for the NuGet Trusted Publishing OIDC exchange
