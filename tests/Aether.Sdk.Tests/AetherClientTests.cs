@@ -14,16 +14,22 @@ internal class MockHttpMessageHandler : HttpMessageHandler
 
     public HttpRequestMessage? LastRequest { get; private set; }
 
+    public string? LastRequestBody { get; private set; }
+
     public MockHttpMessageHandler(Func<HttpRequestMessage, HttpResponseMessage> handler)
     {
         _handler = handler;
     }
 
-    protected override Task<HttpResponseMessage> SendAsync(
+    protected override async Task<HttpResponseMessage> SendAsync(
         HttpRequestMessage request, CancellationToken cancellationToken)
     {
         LastRequest = request;
-        return Task.FromResult(_handler(request));
+        // Read the body eagerly: the client disposes the request after sending.
+        LastRequestBody = request.Content is null
+            ? null
+            : await request.Content.ReadAsStringAsync(cancellationToken);
+        return _handler(request);
     }
 
     public static MockHttpMessageHandler WithJson(object body, HttpStatusCode status = HttpStatusCode.OK)
@@ -148,6 +154,43 @@ public class AetherClientTests
         Assert.Equal(3, result.Chunks);
     }
 
+    [Fact]
+    public async Task Insert_SendsEntityId()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertAsync(
+            Encoding.UTF8.GetBytes("hello"), "test.txt", "text/plain", entityId: "acct/42");
+
+        Assert.Contains("entity_id=acct%2F42", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Insert_OmitsEntityIdWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertAsync(Encoding.UTF8.GetBytes("hello"), "test.txt", "text/plain");
+
+        Assert.DoesNotContain("entity_id", handler.LastRequest!.RequestUri!.Query);
+    }
+
     // ── InsertText ────────────────────────────────────────────────
 
     [Fact]
@@ -168,6 +211,24 @@ public class AetherClientTests
         Assert.NotNull(handler.LastRequest);
         Assert.Contains("filename=text.txt", handler.LastRequest!.RequestUri!.Query);
         Assert.Equal("txt-456", result.DocId);
+    }
+
+    [Fact]
+    public async Task InsertText_SendsEntityId()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "txt-456",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertTextAsync("some text", entityId: "user-7");
+
+        Assert.Contains("entity_id=user-7", handler.LastRequest!.RequestUri!.Query);
     }
 
     // ── InsertStream ─────────────────────────────────────────────
@@ -217,6 +278,25 @@ public class AetherClientTests
     }
 
     [Fact]
+    public async Task InsertStreamAsync_SendsEntityId()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "stream-123",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes("data"));
+        await client.InsertStreamAsync(stream, "test.txt", "text/plain", entityId: "acct/42");
+
+        Assert.Contains("entity_id=acct%2F42", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
     public async Task InsertStreamAsync_DoesNotRetry()
     {
         var callCount = 0;
@@ -262,6 +342,25 @@ public class AetherClientTests
         Assert.Equal(2, result.Version);
     }
 
+    [Fact]
+    public async Task Update_SendsEntityId()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "newhash",
+            chunks = 4,
+            vectors = 4,
+            version = 2,
+        });
+
+        using var client = CreateClient(handler);
+        await client.UpdateAsync(
+            "abc-123", Encoding.UTF8.GetBytes("updated"), "test.txt", entityId: "acct/42");
+
+        Assert.Contains("entity_id=acct%2F42", handler.LastRequest!.RequestUri!.Query);
+    }
+
     // ── Get ───────────────────────────────────────────────────────
 
     [Fact]
@@ -286,6 +385,28 @@ public class AetherClientTests
         Assert.Contains("/documents/abc-123", handler.LastRequest!.RequestUri!.AbsolutePath);
         Assert.Equal("Test Doc", doc.Title);
         Assert.Equal(1024, doc.SizeBytes);
+    }
+
+    [Fact]
+    public async Task Get_DeserializesEntityId()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            content_type = "text/plain",
+            size_bytes = 1024,
+            chunks = 3,
+            vectors = 3,
+            version = 1,
+            entity_id = "acct/42",
+            created_at = "2026-06-01T00:00:00Z",
+        });
+
+        using var client = CreateClient(handler);
+        var doc = await client.GetAsync("abc-123");
+
+        Assert.Equal("acct/42", doc.EntityId);
     }
 
     // ── Download ──────────────────────────────────────────────────
@@ -325,6 +446,50 @@ public class AetherClientTests
         Assert.Equal("b", docs.Documents[1].DocId);
     }
 
+    [Fact]
+    public async Task List_PassesFilters()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            documents = Array.Empty<object>(),
+            count = 0,
+        });
+
+        using var client = CreateClient(handler);
+        await client.ListAsync(
+            entityId: "acct/42",
+            since: "2026-06-01T00:00:00Z",
+            until: "2026-06-10T23:59:59Z",
+            lastNDays: 7);
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("entity_id=acct%2F42", query);
+        Assert.Contains("since=2026-06-01T00%3A00%3A00Z", query);
+        Assert.Contains("until=2026-06-10T23%3A59%3A59Z", query);
+        Assert.Contains("last_n_days=7", query);
+    }
+
+    [Fact]
+    public async Task List_OmitsFiltersWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            documents = Array.Empty<object>(),
+            count = 0,
+        });
+
+        using var client = CreateClient(handler);
+        await client.ListAsync();
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("offset=0", query);
+        Assert.Contains("limit=50", query);
+        Assert.DoesNotContain("entity_id", query);
+        Assert.DoesNotContain("since", query);
+        Assert.DoesNotContain("until", query);
+        Assert.DoesNotContain("last_n_days", query);
+    }
+
     // ── Delete ────────────────────────────────────────────────────
 
     [Fact]
@@ -351,6 +516,84 @@ public class AetherClientTests
 
         Assert.Equal(HttpMethod.Post, handler.LastRequest!.Method);
         Assert.Contains("/documents/abc-123/restore", handler.LastRequest.RequestUri!.AbsolutePath);
+    }
+
+    // ── Backfill entity ───────────────────────────────────────────
+
+    [Fact]
+    public async Task BackfillEntityFromTags_PostsTagPrefixAndOverwrite()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            scanned = 0,
+            updated = 0,
+            skipped_existing = 0,
+            skipped_no_match = 0,
+            skipped_ambiguous = 0,
+            skipped_invalid = 0,
+        });
+
+        using var client = CreateClient(handler);
+        await client.BackfillEntityFromTagsAsync("patient:");
+
+        Assert.NotNull(handler.LastRequest);
+        Assert.Equal(HttpMethod.Post, handler.LastRequest!.Method);
+        Assert.Equal("/documents/backfill-entity", handler.LastRequest.RequestUri!.AbsolutePath);
+
+        var body = handler.LastRequestBody!;
+        Assert.Contains("\"tag_prefix\":\"patient:\"", body);
+        Assert.Contains("\"overwrite\":false", body);
+    }
+
+    [Fact]
+    public async Task BackfillEntityFromTags_ForwardsOverwriteTrue()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            scanned = 0,
+            updated = 0,
+            skipped_existing = 0,
+            skipped_no_match = 0,
+            skipped_ambiguous = 0,
+            skipped_invalid = 0,
+        });
+
+        using var client = CreateClient(handler);
+        await client.BackfillEntityFromTagsAsync("patient:", overwrite: true);
+
+        Assert.Contains("\"overwrite\":true", handler.LastRequestBody!);
+    }
+
+    [Fact]
+    public async Task BackfillEntityFromTags_DeserializesReport()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            scanned = 100,
+            updated = 60,
+            skipped_existing = 20,
+            skipped_no_match = 12,
+            skipped_ambiguous = 5,
+            skipped_invalid = 3,
+        });
+
+        using var client = CreateClient(handler);
+        var report = await client.BackfillEntityFromTagsAsync("patient:");
+
+        Assert.Equal(100, report.Scanned);
+        Assert.Equal(60, report.Updated);
+        Assert.Equal(20, report.SkippedExisting);
+        Assert.Equal(12, report.SkippedNoMatch);
+        Assert.Equal(5, report.SkippedAmbiguous);
+        Assert.Equal(3, report.SkippedInvalid);
+    }
+
+    [Fact]
+    public async Task BackfillEntityFromTags_ThrowsOnEmptyPrefix()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { });
+        var client = CreateClient(handler);
+        await Assert.ThrowsAsync<ArgumentException>(() => client.BackfillEntityFromTagsAsync(""));
     }
 
     // ── Search ────────────────────────────────────────────────────
@@ -385,6 +628,164 @@ public class AetherClientTests
         await client.SearchAsync("test");
 
         Assert.Contains("k=10", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Search_PassesEntityAndTimeFilters()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchAsync(
+            "test",
+            entityId: "acct/42",
+            since: "2026-06-01T00:00:00Z",
+            until: "2026-06-10T23:59:59Z",
+            lastNDays: 7,
+            maxDistance: 0.5f);
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("entity_id=acct%2F42", query);
+        Assert.Contains("since=2026-06-01T00%3A00%3A00Z", query);
+        Assert.Contains("until=2026-06-10T23%3A59%3A59Z", query);
+        Assert.Contains("last_n_days=7", query);
+        Assert.Contains("max_distance=0.5", query);
+    }
+
+    [Fact]
+    public async Task Search_OmitsFilterParamsWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchAsync("test");
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.DoesNotContain("entity_id", query);
+        Assert.DoesNotContain("since", query);
+        Assert.DoesNotContain("until", query);
+        Assert.DoesNotContain("last_n_days", query);
+        Assert.DoesNotContain("max_distance", query);
+    }
+
+    // ── Retrieve ──────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Retrieve_ForwardsFiltersToSearch()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            query = "test",
+            results = new[]
+            {
+                new { doc_id = "abc", distance = 0.1, content = "inline text", content_type = "text/plain" },
+            },
+        });
+
+        using var client = CreateClient(handler);
+        var results = await client.RetrieveAsync(
+            "test",
+            entityId: "acct/42",
+            since: "2026-06-01T00:00:00Z",
+            until: "2026-06-10T23:59:59Z",
+            lastNDays: 7,
+            maxDistance: 0.5f);
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("include_content=true", query);
+        Assert.Contains("entity_id=acct%2F42", query);
+        Assert.Contains("since=2026-06-01T00%3A00%3A00Z", query);
+        Assert.Contains("until=2026-06-10T23%3A59%3A59Z", query);
+        Assert.Contains("last_n_days=7", query);
+        Assert.Contains("max_distance=0.5", query);
+        Assert.Single(results);
+        Assert.Equal("inline text", results[0].Content);
+    }
+
+    // ── BYOE ──────────────────────────────────────────────────────
+
+    [Fact]
+    public async Task SearchByVector_SendsFiltersInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchByVectorAsync(
+            new[] { 0.1f, 0.2f },
+            k: 5,
+            entityId: "acct/42",
+            since: "2026-06-01T00:00:00Z",
+            until: "2026-06-10T23:59:59Z",
+            lastNDays: 7,
+            maxDistance: 0.5f);
+
+        var body = handler.LastRequestBody!;
+        Assert.Contains("\"entity_id\":\"acct/42\"", body);
+        Assert.Contains("\"since\":\"2026-06-01T00:00:00Z\"", body);
+        Assert.Contains("\"until\":\"2026-06-10T23:59:59Z\"", body);
+        Assert.Contains("\"last_n_days\":7", body);
+        Assert.Contains("\"max_distance\":0.5", body);
+    }
+
+    [Fact]
+    public async Task SearchByVector_OmitsFiltersWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchByVectorAsync(new[] { 0.1f, 0.2f });
+
+        var body = handler.LastRequestBody!;
+        Assert.DoesNotContain("entity_id", body);
+        Assert.DoesNotContain("since", body);
+        Assert.DoesNotContain("until", body);
+        Assert.DoesNotContain("last_n_days", body);
+        Assert.DoesNotContain("max_distance", body);
+    }
+
+    [Fact]
+    public async Task InsertWithEmbeddings_SendsEntityIdInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "emb-1",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertWithEmbeddingsAsync(new InsertWithEmbeddingsRequest
+        {
+            Content = "hello",
+            Embedding = new[] { 0.1f, 0.2f },
+            EntityId = "acct/42",
+        });
+
+        Assert.Contains("\"entity_id\":\"acct/42\"", handler.LastRequestBody!);
+    }
+
+    [Fact]
+    public async Task InsertWithEmbeddings_OmitsEntityIdWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "emb-1",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertWithEmbeddingsAsync(new InsertWithEmbeddingsRequest
+        {
+            Content = "hello",
+            Embedding = new[] { 0.1f, 0.2f },
+        });
+
+        Assert.DoesNotContain("entity_id", handler.LastRequestBody!);
     }
 
     // ── Status ────────────────────────────────────────────────────
@@ -568,6 +969,40 @@ public class AetherClientTests
     }
 
     [Fact]
+    public async Task BatchInsertAsync_SendsEntityIdInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1, content_type = "text/plain", size_bytes = 5 } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchInsertAsync(new List<BatchInsertItem>
+        {
+            new() { Filename = "a.txt", Content = "hello", EntityId = "acct/42" },
+        });
+
+        Assert.Contains("\"entity_id\":\"acct/42\"", handler.LastRequestBody!);
+    }
+
+    [Fact]
+    public async Task BatchInsertAsync_OmitsEntityIdWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1, content_type = "text/plain", size_bytes = 5 } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchInsertAsync(new List<BatchInsertItem>
+        {
+            new() { Filename = "a.txt", Content = "hello" },
+        });
+
+        Assert.DoesNotContain("entity_id", handler.LastRequestBody!);
+    }
+
+    [Fact]
     public async Task BatchSearchAsync_SendsTagsAsCommaJoinedString()
     {
         string? capturedBody = null;
@@ -616,6 +1051,59 @@ public class AetherClientTests
         Assert.Equal("test", results[0].Query);
     }
 
+    [Fact]
+    public async Task BatchSearchAsync_SendsFiltersInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new()
+            {
+                Q = "test",
+                K = 5,
+                EntityId = "acct/42",
+                Since = "2026-06-01T00:00:00Z",
+                Until = "2026-06-10T23:59:59Z",
+                LastNDays = 7,
+                MaxDistance = 0.5f,
+            },
+        });
+
+        var body = handler.LastRequestBody!;
+        Assert.Contains("\"entity_id\":\"acct/42\"", body);
+        Assert.Contains("\"since\":\"2026-06-01T00:00:00Z\"", body);
+        Assert.Contains("\"until\":\"2026-06-10T23:59:59Z\"", body);
+        Assert.Contains("\"last_n_days\":7", body);
+        Assert.Contains("\"max_distance\":0.5", body);
+    }
+
+    [Fact]
+    public async Task BatchSearchAsync_OmitsFiltersWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "test", K = 5 },
+        });
+
+        var body = handler.LastRequestBody!;
+        Assert.DoesNotContain("entity_id", body);
+        Assert.DoesNotContain("since", body);
+        Assert.DoesNotContain("until", body);
+        Assert.DoesNotContain("last_n_days", body);
+        Assert.DoesNotContain("max_distance", body);
+    }
+
     // ── Async job operations ─────────────────────────────────────────
 
     [Fact]
@@ -629,6 +1117,17 @@ public class AetherClientTests
         Assert.Equal("j1", result.JobId);
         Assert.NotNull(handler.LastRequest);
         Assert.Contains("/documents/async", handler.LastRequest!.RequestUri!.ToString());
+    }
+
+    [Fact]
+    public async Task EnqueueDocumentAsync_SendsEntityId()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { job_id = "j1", status = "pending", poll_url = "/documents/jobs/j1" });
+        var client = CreateClient(handler);
+
+        await client.EnqueueDocumentAsync(new byte[] { 1, 2, 3 }, "test.bin", entityId: "acct/42");
+
+        Assert.Contains("entity_id=acct%2F42", handler.LastRequest!.RequestUri!.Query);
     }
 
     // ── Input validation ─────────────────────────────────────────────
