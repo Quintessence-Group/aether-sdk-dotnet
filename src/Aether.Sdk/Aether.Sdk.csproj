@@ -14,7 +14,7 @@
          in-source assembly + namespace stay `Aether.Sdk`, so consumers
          install `AetherDb.Sdk` but write `using Aether.Sdk;`. -->
     <PackageId>AetherDb.Sdk</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.0</Version>
     <Authors>Aether Contributors</Authors>
     <Description>.NET SDK for the Aether decentralized RAG API</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
