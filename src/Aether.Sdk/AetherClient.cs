@@ -67,7 +67,8 @@ public class AetherClient : IDisposable
     private static string BuildQueryString(
         string baseQuery,
         IReadOnlyList<string>? tags = null,
-        ChunkingConfig? chunking = null)
+        ChunkingConfig? chunking = null,
+        string? entityId = null)
     {
         var qs = baseQuery;
         if (tags is { Count: > 0 })
@@ -76,6 +77,36 @@ public class AetherClient : IDisposable
             qs += $"&chunk_size={chunking.ChunkSize}";
         if (chunking?.Overlap > 0)
             qs += $"&overlap={chunking.Overlap}";
+        if (!string.IsNullOrEmpty(entityId))
+            qs += $"&entity_id={Uri.EscapeDataString(entityId)}";
+        return qs;
+    }
+
+    /// <summary>
+    /// Appends the entity/time-window read filters (and optional
+    /// <c>max_distance</c>) to a query string. Each filter is omitted when its
+    /// argument is null/empty so the historical "no filter" behavior is
+    /// preserved. Shared by search, retrieve, and list.
+    /// </summary>
+    private static string AppendSearchFilters(
+        string baseQuery,
+        string? entityId,
+        string? since,
+        string? until,
+        int? lastNDays,
+        float? maxDistance = null)
+    {
+        var qs = baseQuery;
+        if (!string.IsNullOrEmpty(entityId))
+            qs += $"&entity_id={Uri.EscapeDataString(entityId)}";
+        if (!string.IsNullOrEmpty(since))
+            qs += $"&since={Uri.EscapeDataString(since)}";
+        if (!string.IsNullOrEmpty(until))
+            qs += $"&until={Uri.EscapeDataString(until)}";
+        if (lastNDays.HasValue)
+            qs += $"&last_n_days={lastNDays.Value}";
+        if (maxDistance.HasValue)
+            qs += $"&max_distance={maxDistance.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
         return qs;
     }
 
@@ -424,12 +455,14 @@ public class AetherClient : IDisposable
 
     /// <summary>Insert a document from raw bytes.
     /// If <paramref name="contentType"/> is null the type is guessed from the filename extension.</summary>
+    /// <param name="entityId">Optional entity ID to associate with the document, for entity-scoped search and list filters.</param>
     public async Task<DocumentRecord> InsertAsync(
         byte[] data,
         string filename,
         string? contentType = null,
         IReadOnlyList<string>? tags = null,
         ChunkingConfig? chunking = null,
+        string? entityId = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(filename))
@@ -441,24 +474,26 @@ public class AetherClient : IDisposable
         contentType ??= GuessContentType(filename);
         var query = BuildQueryString(
             $"filename={Uri.EscapeDataString(filename)}&content_type={Uri.EscapeDataString(contentType)}",
-            tags, chunking);
+            tags, chunking, entityId);
         var content = new ByteArrayContent(data);
         return await RequestAsync<DocumentRecord>(
             $"/documents?{query}", HttpMethod.Post, content, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Insert raw text content.</summary>
+    /// <param name="entityId">Optional entity ID to associate with the document, for entity-scoped search and list filters.</param>
     public async Task<DocumentRecord> InsertTextAsync(
         string text,
         string filename = "text.txt",
         IReadOnlyList<string>? tags = null,
         ChunkingConfig? chunking = null,
+        string? entityId = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(text))
             throw new ArgumentException("text cannot be empty", nameof(text));
         var bytes = Encoding.UTF8.GetBytes(text);
-        return await InsertAsync(bytes, filename, "text/plain", tags, chunking, cancellationToken).ConfigureAwait(false);
+        return await InsertAsync(bytes, filename, "text/plain", tags, chunking, entityId, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Insert a document from a Stream without buffering the entire body in memory.
@@ -468,18 +503,20 @@ public class AetherClient : IDisposable
     /// <param name="filename">Filename for the document. Default: "upload.bin".</param>
     /// <param name="contentType">MIME type. Default: "application/octet-stream".</param>
     /// <param name="tags">Optional tags to associate with the document.</param>
+    /// <param name="entityId">Optional entity ID to associate with the document, for entity-scoped search and list filters.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public async Task<DocumentRecord> InsertStreamAsync(
         Stream stream,
         string filename = "upload.bin",
         string? contentType = null,
         IReadOnlyList<string>? tags = null,
+        string? entityId = null,
         CancellationToken cancellationToken = default)
     {
         contentType ??= "application/octet-stream";
         var query = BuildQueryString(
             $"filename={Uri.EscapeDataString(filename)}&content_type={Uri.EscapeDataString(contentType)}",
-            tags);
+            tags, entityId: entityId);
         var url = $"{_baseUrl}/documents?{query}";
 
         HttpResponseMessage response;
@@ -539,6 +576,8 @@ public class AetherClient : IDisposable
 
     /// <summary>Update an existing document.
     /// If <paramref name="contentType"/> is null the type is guessed from the filename extension.</summary>
+    /// <param name="entityId">New entity ID for the document. The update replaces the stored entity ID;
+    /// when omitted, any existing entity ID is cleared (mirrors tags semantics).</param>
     public async Task<DocumentRecord> UpdateAsync(
         string docId,
         byte[] data,
@@ -546,6 +585,7 @@ public class AetherClient : IDisposable
         string? contentType = null,
         IReadOnlyList<string>? tags = null,
         ChunkingConfig? chunking = null,
+        string? entityId = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(docId))
@@ -559,7 +599,7 @@ public class AetherClient : IDisposable
         contentType ??= GuessContentType(filename);
         var query = BuildQueryString(
             $"filename={Uri.EscapeDataString(filename)}&content_type={Uri.EscapeDataString(contentType)}",
-            tags, chunking);
+            tags, chunking, entityId);
         var content = new ByteArrayContent(data);
         return await RequestAsync<DocumentRecord>(
             $"/documents/{Uri.EscapeDataString(docId)}?{query}", HttpMethod.Put, content, cancellationToken).ConfigureAwait(false);
@@ -590,14 +630,23 @@ public class AetherClient : IDisposable
     /// <summary>List active documents with pagination.</summary>
     /// <param name="offset">Number of documents to skip. Default: 0.</param>
     /// <param name="limit">Maximum documents to return. Default: 50, max: 1000.</param>
+    /// <param name="entityId">Only list documents with this entity ID.</param>
+    /// <param name="since">Only list documents created at or after this RFC 3339 timestamp (inclusive).</param>
+    /// <param name="until">Only list documents created at or before this RFC 3339 timestamp (inclusive).</param>
+    /// <param name="lastNDays">Only list documents created in the last N days (UTC, server clock).</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public async Task<DocumentListResult> ListAsync(
         int offset = 0,
         int limit = 50,
+        string? entityId = null,
+        string? since = null,
+        string? until = null,
+        int? lastNDays = null,
         CancellationToken cancellationToken = default)
     {
+        var qs = AppendSearchFilters($"offset={offset}&limit={limit}", entityId, since, until, lastNDays);
         var response = await RequestAsync<DocumentListResponse>(
-            $"/documents?offset={offset}&limit={limit}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+            $"/documents?{qs}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
         return new DocumentListResult
         {
             Documents = response.Documents,
@@ -628,12 +677,40 @@ public class AetherClient : IDisposable
             $"/documents/{Uri.EscapeDataString(docId)}/restore", HttpMethod.Post, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>Backfill <c>entity_id</c> on the tenant's existing documents from a tag convention.
+    /// For every active document, a tag starting with <paramref name="tagPrefix"/> (e.g. <c>"patient:"</c>)
+    /// sets the entity ID to the suffix after the prefix when exactly one such tag exists; documents with
+    /// ambiguous (two or more) or absent matches are skipped. Documents that already have an entity ID are
+    /// left alone unless <paramref name="overwrite"/> is true. This is a metadata-only operation — documents
+    /// are not re-embedded.</summary>
+    /// <param name="tagPrefix">Tag prefix to match (required, non-empty); the suffix after it becomes the entity ID.</param>
+    /// <param name="overwrite">When true, also overwrite documents that already have an entity ID. Default: false.</param>
+    /// <param name="ct">Cancellation token.</param>
+    /// <returns>A report tallying scanned, updated, and skipped documents.</returns>
+    public async Task<EntityBackfillReport> BackfillEntityFromTagsAsync(
+        string tagPrefix,
+        bool overwrite = false,
+        CancellationToken ct = default)
+    {
+        if (string.IsNullOrEmpty(tagPrefix))
+            throw new ArgumentException("tagPrefix cannot be empty", nameof(tagPrefix));
+        var body = new EntityBackfillRequest { TagPrefix = tagPrefix, Overwrite = overwrite };
+        var json = JsonSerializer.Serialize(body, JsonOptions);
+        var content = new StringContent(json, Encoding.UTF8, "application/json");
+        return await RequestAsync<EntityBackfillReport>(
+            "/documents/backfill-entity", HttpMethod.Post, content, ct).ConfigureAwait(false);
+    }
+
     // ── Search ────────────────────────────────────────────────────────
 
     /// <summary>Similarity search across documents.</summary>
     /// <param name="query">Natural language search query.</param>
     /// <param name="k">Maximum number of results to return. Default: 10.</param>
     /// <param name="tags">Optional tags to filter results.</param>
+    /// <param name="entityId">Only match documents with this entity ID.</param>
+    /// <param name="since">Only match documents created at or after this RFC 3339 timestamp (inclusive).</param>
+    /// <param name="until">Only match documents created at or before this RFC 3339 timestamp (inclusive).</param>
+    /// <param name="lastNDays">Only match documents created in the last N days (UTC, server clock).</param>
     /// <param name="maxDistance">
     /// Optional cosine-distance ceiling. Results with
     /// <c>distance &gt; maxDistance</c> are dropped server-side, after reranking.
@@ -646,6 +723,10 @@ public class AetherClient : IDisposable
         string query,
         int k = 10,
         IReadOnlyList<string>? tags = null,
+        string? entityId = null,
+        string? since = null,
+        string? until = null,
+        int? lastNDays = null,
         float? maxDistance = null,
         CancellationToken cancellationToken = default)
     {
@@ -656,8 +737,7 @@ public class AetherClient : IDisposable
         var qs = $"q={Uri.EscapeDataString(query)}&k={k}";
         if (tags is { Count: > 0 })
             qs += $"&tags={Uri.EscapeDataString(string.Join(",", tags))}";
-        if (maxDistance.HasValue)
-            qs += $"&max_distance={maxDistance.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
+        qs = AppendSearchFilters(qs, entityId, since, until, lastNDays, maxDistance);
         var response = await RequestAsync<SearchResponse>(
             $"/search?{qs}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
         return response.Results;
@@ -668,6 +748,10 @@ public class AetherClient : IDisposable
     /// <param name="query">Natural language search query.</param>
     /// <param name="k">Maximum number of results to return. Default: 5.</param>
     /// <param name="tags">Optional tags to filter results.</param>
+    /// <param name="entityId">Only match documents with this entity ID.</param>
+    /// <param name="since">Only match documents created at or after this RFC 3339 timestamp (inclusive).</param>
+    /// <param name="until">Only match documents created at or before this RFC 3339 timestamp (inclusive).</param>
+    /// <param name="lastNDays">Only match documents created in the last N days (UTC, server clock).</param>
     /// <param name="maxDistance">
     /// Optional cosine-distance ceiling. See <see cref="SearchAsync"/> for
     /// semantics.
@@ -677,6 +761,10 @@ public class AetherClient : IDisposable
         string query,
         int k = 5,
         IReadOnlyList<string>? tags = null,
+        string? entityId = null,
+        string? since = null,
+        string? until = null,
+        int? lastNDays = null,
         float? maxDistance = null,
         CancellationToken cancellationToken = default)
     {
@@ -687,8 +775,7 @@ public class AetherClient : IDisposable
         var qs = $"q={Uri.EscapeDataString(query)}&k={k}&include_content=true";
         if (tags is { Count: > 0 })
             qs += $"&tags={Uri.EscapeDataString(string.Join(",", tags))}";
-        if (maxDistance.HasValue)
-            qs += $"&max_distance={maxDistance.Value.ToString(System.Globalization.CultureInfo.InvariantCulture)}";
+        qs = AppendSearchFilters(qs, entityId, since, until, lastNDays, maxDistance);
         var response = await RequestAsync<SearchResponse>(
             $"/search?{qs}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
 
@@ -740,6 +827,10 @@ public class AetherClient : IDisposable
     /// <param name="k">Maximum number of results to return. Default: 10.</param>
     /// <param name="includeContent">Whether to include document content in results. Default: false.</param>
     /// <param name="tags">Optional tags to filter results.</param>
+    /// <param name="entityId">Only match documents with this entity ID.</param>
+    /// <param name="since">Only match documents created at or after this RFC 3339 timestamp (inclusive).</param>
+    /// <param name="until">Only match documents created at or before this RFC 3339 timestamp (inclusive).</param>
+    /// <param name="lastNDays">Only match documents created in the last N days (UTC, server clock).</param>
     /// <param name="maxDistance">
     /// Optional cosine-distance ceiling. See <see cref="SearchAsync"/> for
     /// semantics.
@@ -750,6 +841,10 @@ public class AetherClient : IDisposable
         int k = 10,
         bool includeContent = false,
         IReadOnlyList<string>? tags = null,
+        string? entityId = null,
+        string? since = null,
+        string? until = null,
+        int? lastNDays = null,
         float? maxDistance = null,
         CancellationToken cancellationToken = default)
     {
@@ -763,6 +858,10 @@ public class AetherClient : IDisposable
             K = k,
             IncludeContent = includeContent,
             Tags = tags is { Count: > 0 } ? new List<string>(tags) : null,
+            EntityId = string.IsNullOrEmpty(entityId) ? null : entityId,
+            Since = string.IsNullOrEmpty(since) ? null : since,
+            Until = string.IsNullOrEmpty(until) ? null : until,
+            LastNDays = lastNDays,
             MaxDistance = maxDistance,
         };
         var json = JsonSerializer.Serialize(body, JsonOptions);
@@ -775,12 +874,14 @@ public class AetherClient : IDisposable
     // ── Async Processing ──────────────────────────────────────────────
 
     /// <summary>Enqueue a document for asynchronous processing. Useful for large documents.</summary>
+    /// <param name="entityId">Optional entity ID to associate with the document, for entity-scoped search and list filters.</param>
     public async Task<AsyncJobResult> EnqueueDocumentAsync(
         byte[] data,
         string filename,
         string? contentType = null,
         IReadOnlyList<string>? tags = null,
         ChunkingConfig? chunking = null,
+        string? entityId = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(filename))
@@ -792,7 +893,7 @@ public class AetherClient : IDisposable
         contentType ??= GuessContentType(filename);
         var query = BuildQueryString(
             $"filename={Uri.EscapeDataString(filename)}&content_type={Uri.EscapeDataString(contentType)}",
-            tags, chunking);
+            tags, chunking, entityId);
         var content = new ByteArrayContent(data);
         return await RequestAsync<AsyncJobResult>(
             $"/documents/async?{query}", HttpMethod.Post, content, cancellationToken).ConfigureAwait(false);
@@ -851,6 +952,7 @@ public class AetherClient : IDisposable
                 Filename = d.Filename,
                 Content = d.Content,
                 Tags = JoinTags(d.Tags),
+                EntityId = string.IsNullOrEmpty(d.EntityId) ? null : d.EntityId,
             }),
         };
         if (chunking?.ChunkSize > 0)
@@ -882,6 +984,10 @@ public class AetherClient : IDisposable
                 K = q.K,
                 Tags = JoinTags(q.Tags),
                 IncludeContent = q.IncludeContent,
+                EntityId = string.IsNullOrEmpty(q.EntityId) ? null : q.EntityId,
+                Since = string.IsNullOrEmpty(q.Since) ? null : q.Since,
+                Until = string.IsNullOrEmpty(q.Until) ? null : q.Until,
+                LastNDays = q.LastNDays,
                 MaxDistance = q.MaxDistance,
             }),
         };

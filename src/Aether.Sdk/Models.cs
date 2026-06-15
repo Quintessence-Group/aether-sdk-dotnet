@@ -28,6 +28,9 @@ public class DocumentRecord
     [JsonPropertyName("version")]
     public int Version { get; set; } = 1;
 
+    [JsonPropertyName("entity_id")]
+    public string? EntityId { get; set; }
+
     [JsonPropertyName("created_at")]
     public string? CreatedAt { get; set; }
 
@@ -166,6 +169,10 @@ public class BatchInsertItem
 
     [JsonPropertyName("tags")]
     public List<string>? Tags { get; set; }
+
+    /// <summary>Optional entity ID to associate with this document, for entity-scoped search and list filters.</summary>
+    [JsonPropertyName("entity_id")]
+    public string? EntityId { get; set; }
 }
 
 /// <summary>A query in a batch search request.</summary>
@@ -182,6 +189,26 @@ public class BatchSearchQuery
 
     [JsonPropertyName("include_content")]
     public bool IncludeContent { get; set; }
+
+    /// <summary>Only match documents with this entity ID.</summary>
+    [JsonPropertyName("entity_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EntityId { get; set; }
+
+    /// <summary>Only match documents created at or after this RFC 3339 timestamp (inclusive).</summary>
+    [JsonPropertyName("since")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Since { get; set; }
+
+    /// <summary>Only match documents created at or before this RFC 3339 timestamp (inclusive).</summary>
+    [JsonPropertyName("until")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Until { get; set; }
+
+    /// <summary>Only match documents created in the last N days (UTC, server clock).</summary>
+    [JsonPropertyName("last_n_days")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? LastNDays { get; set; }
 
     /// <summary>
     /// Optional cosine-distance ceiling. Results with
@@ -229,6 +256,35 @@ public class JobStatus
     public string? Error { get; set; }
 }
 
+/// <summary>Tallies returned by <see cref="AetherClient.BackfillEntityFromTagsAsync"/>,
+/// reporting how the tenant's documents were affected by an entity-ID backfill.</summary>
+public class EntityBackfillReport
+{
+    /// <summary>Number of active documents examined.</summary>
+    [JsonPropertyName("scanned")]
+    public int Scanned { get; set; }
+
+    /// <summary>Number of documents whose entity ID was set from a matching tag.</summary>
+    [JsonPropertyName("updated")]
+    public int Updated { get; set; }
+
+    /// <summary>Documents skipped because they already had an entity ID (and overwrite was false).</summary>
+    [JsonPropertyName("skipped_existing")]
+    public int SkippedExisting { get; set; }
+
+    /// <summary>Documents skipped because no tag matched the prefix.</summary>
+    [JsonPropertyName("skipped_no_match")]
+    public int SkippedNoMatch { get; set; }
+
+    /// <summary>Documents skipped because two or more tags matched the prefix.</summary>
+    [JsonPropertyName("skipped_ambiguous")]
+    public int SkippedAmbiguous { get; set; }
+
+    /// <summary>Documents skipped because the derived entity ID was invalid.</summary>
+    [JsonPropertyName("skipped_invalid")]
+    public int SkippedInvalid { get; set; }
+}
+
 // Internal response wrappers (not exported)
 internal class DocumentListResponse
 {
@@ -273,6 +329,11 @@ public class InsertWithEmbeddingsRequest
 
     [JsonPropertyName("tags")]
     public List<string>? Tags { get; set; }
+
+    /// <summary>Optional entity ID to associate with the document, for entity-scoped search and list filters.</summary>
+    [JsonPropertyName("entity_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EntityId { get; set; }
 }
 
 internal class VectorSearchRequest
@@ -288,6 +349,22 @@ internal class VectorSearchRequest
 
     [JsonPropertyName("tags")]
     public List<string>? Tags { get; set; }
+
+    [JsonPropertyName("entity_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EntityId { get; set; }
+
+    [JsonPropertyName("since")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Since { get; set; }
+
+    [JsonPropertyName("until")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Until { get; set; }
+
+    [JsonPropertyName("last_n_days")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? LastNDays { get; set; }
 
     [JsonPropertyName("max_distance")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -323,6 +400,10 @@ internal class BatchInsertWireItem
     [JsonPropertyName("tags")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Tags { get; set; }
+
+    [JsonPropertyName("entity_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EntityId { get; set; }
 }
 
 /// <summary>Wire shape for a batch search query; <c>tags</c> is a comma-joined string.</summary>
@@ -341,6 +422,22 @@ internal class BatchSearchWireQuery
     [JsonPropertyName("include_content")]
     public bool IncludeContent { get; set; }
 
+    [JsonPropertyName("entity_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EntityId { get; set; }
+
+    [JsonPropertyName("since")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Since { get; set; }
+
+    [JsonPropertyName("until")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Until { get; set; }
+
+    [JsonPropertyName("last_n_days")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public int? LastNDays { get; set; }
+
     [JsonPropertyName("max_distance")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public float? MaxDistance { get; set; }
@@ -356,6 +453,15 @@ internal class BatchSearchRequest
 {
     [JsonPropertyName("queries")]
     public List<BatchSearchWireQuery> Queries { get; set; } = new();
+}
+
+internal class EntityBackfillRequest
+{
+    [JsonPropertyName("tag_prefix")]
+    public string TagPrefix { get; set; } = "";
+
+    [JsonPropertyName("overwrite")]
+    public bool Overwrite { get; set; }
 }
 
 internal class BatchSearchResponseWrapper
