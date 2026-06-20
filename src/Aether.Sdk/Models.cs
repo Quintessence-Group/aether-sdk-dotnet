@@ -63,6 +63,13 @@ public class SearchResult
     /// </summary>
     [JsonPropertyName("passage")]
     public string? Passage { get; set; }
+
+    /// <summary>
+    /// The entity (subject) this document was written under, if any. The engine
+    /// emits <c>entity_id</c> on every search hit; mirrors <see cref="DocumentRecord.EntityId"/>.
+    /// </summary>
+    [JsonPropertyName("entity_id")]
+    public string? EntityId { get; set; }
 }
 
 public class NodeStatus
@@ -131,6 +138,13 @@ public class RetrievalResult
 
     [JsonPropertyName("passage")]
     public string? Passage { get; set; }
+
+    /// <summary>
+    /// The entity (subject) this document was written under, if any. See
+    /// <see cref="SearchResult.EntityId"/>.
+    /// </summary>
+    [JsonPropertyName("entity_id")]
+    public string? EntityId { get; set; }
 }
 
 /// <summary>A text passage with its precomputed embedding vector.</summary>
