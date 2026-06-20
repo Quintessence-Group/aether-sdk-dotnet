@@ -43,8 +43,12 @@ public class SearchResult
     [JsonPropertyName("doc_id")]
     public string DocId { get; set; } = "";
 
-    [JsonPropertyName("distance")]
-    public double Distance { get; set; }
+    /// <summary>
+    /// Calibrated relevance, 0–100 (higher = better); ~100 for a near-exact
+    /// match. Computed server-side as <c>round(100 * (1 - cosine_distance))</c>.
+    /// </summary>
+    [JsonPropertyName("score")]
+    public int Score { get; set; }
 
     [JsonPropertyName("title")]
     public string? Title { get; set; }
@@ -52,9 +56,11 @@ public class SearchResult
     [JsonPropertyName("content_type")]
     public string ContentType { get; set; } = "text/plain";
 
-    [JsonPropertyName("content")]
-    public string? Content { get; set; }
-
+    /// <summary>
+    /// The specific passage (chunk) that matched the query. Fetch the full
+    /// document text with <see cref="AetherClient.DownloadAsync"/> rather than
+    /// inlining it — search never returns full document content.
+    /// </summary>
     [JsonPropertyName("passage")]
     public string? Passage { get; set; }
 }
@@ -103,15 +109,17 @@ public class ArchivePrice
     public ulong CacheTtlSeconds { get; set; }
 }
 
-/// <summary>Extends SearchResult with document content for RAG workflows.</summary>
+/// <summary>Extends SearchResult with full document content for RAG workflows.</summary>
 public class RetrievalResult
 {
     [JsonPropertyName("doc_id")]
     public string DocId { get; set; } = "";
 
-    [JsonPropertyName("distance")]
-    public double Distance { get; set; }
+    /// <summary>Calibrated relevance, 0–100 (higher = better). See <see cref="SearchResult.Score"/>.</summary>
+    [JsonPropertyName("score")]
+    public int Score { get; set; }
 
+    /// <summary>Full document content as text, for use in RAG prompts.</summary>
     [JsonPropertyName("content")]
     public string Content { get; set; } = "";
 
@@ -186,9 +194,6 @@ public class BatchSearchQuery
 
     [JsonPropertyName("tags")]
     public List<string>? Tags { get; set; }
-
-    [JsonPropertyName("include_content")]
-    public bool IncludeContent { get; set; }
 
     /// <summary>Only match documents with this entity ID.</summary>
     [JsonPropertyName("entity_id")]
@@ -344,9 +349,6 @@ internal class VectorSearchRequest
     [JsonPropertyName("k")]
     public int K { get; set; }
 
-    [JsonPropertyName("include_content")]
-    public bool IncludeContent { get; set; }
-
     [JsonPropertyName("tags")]
     public List<string>? Tags { get; set; }
 
@@ -418,9 +420,6 @@ internal class BatchSearchWireQuery
     [JsonPropertyName("tags")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? Tags { get; set; }
-
-    [JsonPropertyName("include_content")]
-    public bool IncludeContent { get; set; }
 
     [JsonPropertyName("entity_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]

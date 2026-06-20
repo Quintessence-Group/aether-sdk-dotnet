@@ -743,8 +743,11 @@ public class AetherClient : IDisposable
         return response.Results;
     }
 
-    /// <summary>Search with content retrieval. Results are deduplicated by DocId (closest match wins).
-    /// Falls back to <see cref="DownloadAsync"/> for results missing inline content.</summary>
+    /// <summary>Search and attach full document content for RAG workflows.
+    /// Combines <see cref="SearchAsync"/> with per-document downloads. Results
+    /// are deduplicated by DocId (best match wins). Since search no longer
+    /// returns full document content, each unique document's text is always
+    /// fetched by id via <see cref="DownloadAsync"/>.</summary>
     /// <param name="query">Natural language search query.</param>
     /// <param name="k">Maximum number of results to return. Default: 5.</param>
     /// <param name="tags">Optional tags to filter results.</param>
@@ -772,31 +775,27 @@ public class AetherClient : IDisposable
             throw new ArgumentException("query cannot be empty", nameof(query));
         if (k < 1)
             throw new ArgumentOutOfRangeException(nameof(k), "k must be at least 1");
-        var qs = $"q={Uri.EscapeDataString(query)}&k={k}&include_content=true";
-        if (tags is { Count: > 0 })
-            qs += $"&tags={Uri.EscapeDataString(string.Join(",", tags))}";
-        qs = AppendSearchFilters(qs, entityId, since, until, lastNDays, maxDistance);
-        var response = await RequestAsync<SearchResponse>(
-            $"/search?{qs}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+        var hits = await SearchAsync(
+            query, k, tags, entityId, since, until, lastNDays, maxDistance, cancellationToken)
+            .ConfigureAwait(false);
 
-        // Deduplicate by DocId, keeping the closest match
+        // Deduplicate by DocId, keeping the best match (search returns
+        // highest-scoring first).
         var seen = new HashSet<string>();
         var results = new List<RetrievalResult>();
-        foreach (var r in response.Results)
+        foreach (var r in hits)
         {
             if (!seen.Add(r.DocId)) continue;
 
-            var content = r.Content;
-            if (content == null)
-            {
-                var bytes = await DownloadAsync(r.DocId, cancellationToken).ConfigureAwait(false);
-                content = Encoding.UTF8.GetString(bytes);
-            }
+            // Search returns only the matched passage now (never full document
+            // content), so fetch each unique document's text by id for RAG prompts.
+            var bytes = await DownloadAsync(r.DocId, cancellationToken).ConfigureAwait(false);
+            var content = Encoding.UTF8.GetString(bytes);
 
             results.Add(new RetrievalResult
             {
                 DocId = r.DocId,
-                Distance = r.Distance,
+                Score = r.Score,
                 Content = content,
                 Title = r.Title,
                 ContentType = r.ContentType,
@@ -825,7 +824,6 @@ public class AetherClient : IDisposable
     /// <summary>Search by raw embedding vector (BYOE — bring your own embeddings).</summary>
     /// <param name="embedding">The query embedding vector.</param>
     /// <param name="k">Maximum number of results to return. Default: 10.</param>
-    /// <param name="includeContent">Whether to include document content in results. Default: false.</param>
     /// <param name="tags">Optional tags to filter results.</param>
     /// <param name="entityId">Only match documents with this entity ID.</param>
     /// <param name="since">Only match documents created at or after this RFC 3339 timestamp (inclusive).</param>
@@ -839,7 +837,6 @@ public class AetherClient : IDisposable
     public async Task<List<SearchResult>> SearchByVectorAsync(
         float[] embedding,
         int k = 10,
-        bool includeContent = false,
         IReadOnlyList<string>? tags = null,
         string? entityId = null,
         string? since = null,
@@ -856,7 +853,6 @@ public class AetherClient : IDisposable
         {
             Embedding = embedding,
             K = k,
-            IncludeContent = includeContent,
             Tags = tags is { Count: > 0 } ? new List<string>(tags) : null,
             EntityId = string.IsNullOrEmpty(entityId) ? null : entityId,
             Since = string.IsNullOrEmpty(since) ? null : since,
@@ -983,7 +979,6 @@ public class AetherClient : IDisposable
                 Q = q.Q,
                 K = q.K,
                 Tags = JoinTags(q.Tags),
-                IncludeContent = q.IncludeContent,
                 EntityId = string.IsNullOrEmpty(q.EntityId) ? null : q.EntityId,
                 Since = string.IsNullOrEmpty(q.Since) ? null : q.Since,
                 Until = string.IsNullOrEmpty(q.Until) ? null : q.Until,
