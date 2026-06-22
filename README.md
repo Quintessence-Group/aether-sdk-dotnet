@@ -8,6 +8,44 @@
 dotnet add package Aether.Sdk
 ```
 
+## Memory — the fastest way to build agent memory
+
+For per-user or per-agent memory, reach for the `Memory` facade. Construct it once
+with an entity id and every call is automatically scoped to that entity — no tags or
+filters to manage:
+
+```csharp
+using Aether.Sdk;
+
+using var mem = new Memory("patient-john", new MemoryOptions
+{
+    ApiKey = "aether_your_key_here",
+});
+
+// Store a memory
+await mem.RememberAsync("Anxious about flying; uses 4-7-8 breathing");
+
+// Recall the most relevant memories for this entity
+foreach (var item in await mem.RecallAsync("anxiety coping"))
+    Console.WriteLine($"{item.Score}  {item.Text}");
+
+// Newest-first history, or wipe the slate
+await mem.ListAsync(limit: 20);
+await mem.ForgetAllAsync();
+```
+
+- `RecallAsync(query, k: 5, recencyWeight: 0.0, since: ..., until: ...)` blends
+  relevance (a calibrated `score`, 0–100, normalized to `[0, 1]`) with optional
+  exponential recency decay.
+- `RememberAsync(text, metadata)` stores the memory and writes `metadata` as
+  searchable `key:value` tags (write-only in v1 — it cannot be read back).
+- Every operation is `async`; pass a `CancellationToken` to any call. Inject your
+  own `AetherClient` with `new Memory(entityId, client)` to share one client across
+  many entities.
+
+The raw `AetherClient` below is the lower-level API — use it when you need direct
+control over documents, search, and batch operations rather than entity-scoped memory.
+
 ## Quick Start
 
 ```csharp
@@ -26,7 +64,7 @@ Console.WriteLine($"Inserted: {doc.DocId}");
 // Search
 var results = await client.SearchAsync("machine learning", k: 5);
 foreach (var r in results)
-    Console.WriteLine($"  {r.DocId} (distance: {r.Distance:F3})");
+    Console.WriteLine($"  {r.DocId} (score: {r.Score})");
 
 // Insert raw text
 var textDoc = await client.InsertTextAsync("Some text content to index");
