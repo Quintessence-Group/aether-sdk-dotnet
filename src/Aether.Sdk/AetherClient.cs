@@ -18,7 +18,7 @@ public class AetherClient : IDisposable
     private bool _disposed;
 
     /// <summary>SDK version, reported in the User-Agent header. Keep in sync with the csproj &lt;Version&gt;.</summary>
-    private const string Version = "0.3.0";
+    private const string Version = "0.3.1";
 
     private static readonly HashSet<HttpStatusCode> RetryableStatusCodes = new()
     {
