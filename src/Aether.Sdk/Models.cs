@@ -45,7 +45,7 @@ public class SearchResult
 
     /// <summary>
     /// Calibrated relevance, 0–100 (higher = better); ~100 for a near-exact
-    /// match. Computed server-side as <c>round(100 * (1 - cosine_distance))</c>.
+    /// match. Computed server-side from the semantic similarity of the match.
     /// </summary>
     [JsonPropertyName("score")]
     public int Score { get; set; }
