@@ -712,8 +712,8 @@ public class AetherClient : IDisposable
     /// <param name="until">Only match documents created at or before this RFC 3339 timestamp (inclusive).</param>
     /// <param name="lastNDays">Only match documents created in the last N days (UTC, server clock).</param>
     /// <param name="maxDistance">
-    /// Optional cosine-distance ceiling. Results with
-    /// <c>distance &gt; maxDistance</c> are dropped server-side, after reranking.
+    /// Optional relevance-distance ceiling. Results with
+    /// <c>distance &gt; maxDistance</c> are dropped server-side.
     /// Smaller is stricter (0.0 = exact match, ~1.0 = unrelated). Pass
     /// <c>null</c> to return the top-k regardless of distance — the historical
     /// behavior.
@@ -756,7 +756,7 @@ public class AetherClient : IDisposable
     /// <param name="until">Only match documents created at or before this RFC 3339 timestamp (inclusive).</param>
     /// <param name="lastNDays">Only match documents created in the last N days (UTC, server clock).</param>
     /// <param name="maxDistance">
-    /// Optional cosine-distance ceiling. See <see cref="SearchAsync"/> for
+    /// Optional relevance-distance ceiling. See <see cref="SearchAsync"/> for
     /// semantics.
     /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
@@ -830,7 +830,7 @@ public class AetherClient : IDisposable
     /// <param name="until">Only match documents created at or before this RFC 3339 timestamp (inclusive).</param>
     /// <param name="lastNDays">Only match documents created in the last N days (UTC, server clock).</param>
     /// <param name="maxDistance">
-    /// Optional cosine-distance ceiling. See <see cref="SearchAsync"/> for
+    /// Optional relevance-distance ceiling. See <see cref="SearchAsync"/> for
     /// semantics.
     /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>

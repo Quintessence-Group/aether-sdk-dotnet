@@ -6,7 +6,7 @@ using Xunit;
 namespace Aether.Sdk.Tests;
 
 /// <summary>
-/// Contract test for the <see cref="Memory"/> facade (AET-145), mocked at the same
+/// Contract test for the <see cref="Memory"/> facade, mocked at the same
 /// transport layer as the raw-client tests (a routing <see cref="HttpMessageHandler"/>)
 /// with the real <see cref="AetherClient"/> underneath, constructed via the DI path
 /// (<c>new Memory(entityId, client)</c>).

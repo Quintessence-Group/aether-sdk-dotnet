@@ -230,9 +230,9 @@ public class BatchSearchQuery
     public int? LastNDays { get; set; }
 
     /// <summary>
-    /// Optional cosine-distance ceiling. Results with
+    /// Optional relevance-distance ceiling. Results with
     /// <c>distance &gt; MaxDistance</c> are dropped server-side, after
-    /// reranking. Leave null to return the top-k regardless of distance.
+    /// . Leave null to return the top-k regardless of distance.
     /// </summary>
     [JsonPropertyName("max_distance")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
