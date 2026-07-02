@@ -5,8 +5,11 @@
 ## Installation
 
 ```bash
-dotnet add package Aether.Sdk
+dotnet add package AetherDb.Sdk
 ```
+
+The package installs as `AetherDb.Sdk`; the assembly and namespace stay `Aether.Sdk`
+(`using Aether.Sdk;`).
 
 ## Memory — the fastest way to build agent memory
 
@@ -70,8 +73,8 @@ foreach (var r in results)
 var textDoc = await client.InsertTextAsync("Some text content to index");
 
 // List documents
-var docs = await client.ListAsync();
-foreach (var d in docs)
+var listing = await client.ListAsync();
+foreach (var d in listing.Documents)
     Console.WriteLine($"  {d.DocId}: {d.Title}");
 ```
 
