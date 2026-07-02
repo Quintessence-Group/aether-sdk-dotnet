@@ -1284,7 +1284,7 @@ public class AetherClientTests
     [Fact]
     public async Task Retrieve_CarriesScoreAndPropagatesUpdatedAt()
     {
-        var searchJson = JsonSerializer.Serialize(new
+        var handler = MockHttpMessageHandler.WithJson(new
         {
             query = "test",
             results = new[]
@@ -1293,29 +1293,20 @@ public class AetherClientTests
                 {
                     doc_id = "abc",
                     score = 80,
+                    content = "inline text",
                     content_type = "text/plain",
                     created_at = "2026-06-01T00:00:00Z",
                     updated_at = "2026-06-20T09:00:00Z",
                 },
             },
         });
-        var handler = new MockHttpMessageHandler(req =>
-            req.RequestUri!.AbsolutePath.EndsWith("/download")
-                ? new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new ByteArrayContent(Encoding.UTF8.GetBytes("full text")),
-                }
-                : new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new StringContent(searchJson, Encoding.UTF8, "application/json"),
-                });
 
         using var client = CreateClient(handler);
         var results = await client.RetrieveAsync("test");
 
         Assert.Single(results);
         Assert.Equal(80, results[0].Score);
-        Assert.Equal("full text", results[0].Content);
+        Assert.Equal("inline text", results[0].Content);
         Assert.Equal("2026-06-01T00:00:00Z", results[0].CreatedAt);
         Assert.Equal("2026-06-20T09:00:00Z", results[0].UpdatedAt);
     }
@@ -1494,27 +1485,13 @@ public class AetherClientTests
     [Fact]
     public async Task Retrieve_ForwardsFiltersToSearch()
     {
-        var searchJson = JsonSerializer.Serialize(new
+        var handler = MockHttpMessageHandler.WithJson(new
         {
             query = "test",
             results = new[]
             {
-                new { doc_id = "abc", score = 90, content_type = "text/plain" },
+                new { doc_id = "abc", score = 90, content = "inline text", content_type = "text/plain" },
             },
-        });
-        string? searchQuery = null;
-        var handler = new MockHttpMessageHandler(req =>
-        {
-            if (req.RequestUri!.AbsolutePath.EndsWith("/download"))
-                return new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new ByteArrayContent(Encoding.UTF8.GetBytes("full text")),
-                };
-            searchQuery = req.RequestUri.Query;
-            return new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent(searchJson, Encoding.UTF8, "application/json"),
-            };
         });
 
         using var client = CreateClient(handler);
@@ -1526,14 +1503,15 @@ public class AetherClientTests
             lastNDays: 7,
             maxDistance: 0.5f);
 
-        Assert.NotNull(searchQuery);
-        Assert.Contains("entity_id=acct%2F42", searchQuery);
-        Assert.Contains("since=2026-06-01T00%3A00%3A00Z", searchQuery);
-        Assert.Contains("until=2026-06-10T23%3A59%3A59Z", searchQuery);
-        Assert.Contains("last_n_days=7", searchQuery);
-        Assert.Contains("max_distance=0.5", searchQuery);
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("include_content=true", query);
+        Assert.Contains("entity_id=acct%2F42", query);
+        Assert.Contains("since=2026-06-01T00%3A00%3A00Z", query);
+        Assert.Contains("until=2026-06-10T23%3A59%3A59Z", query);
+        Assert.Contains("last_n_days=7", query);
+        Assert.Contains("max_distance=0.5", query);
         Assert.Single(results);
-        Assert.Equal("full text", results[0].Content);
+        Assert.Equal("inline text", results[0].Content);
     }
 
     [Fact]
@@ -1566,6 +1544,7 @@ public class AetherClientTests
                 {
                     doc_id = "abc",
                     score = 90,
+                    content = "inline text",
                     content_type = "text/plain",
                     tags = new[] { "a", "b" },
                     source = "notion",
@@ -1573,16 +1552,10 @@ public class AetherClientTests
                 },
             },
         });
-        var handler = new MockHttpMessageHandler(req =>
-            req.RequestUri!.AbsolutePath.EndsWith("/download")
-                ? new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new ByteArrayContent(Encoding.UTF8.GetBytes("full text")),
-                }
-                : new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new StringContent(searchJson, Encoding.UTF8, "application/json"),
-                });
+        var handler = new MockHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.OK)
+        {
+            Content = new StringContent(searchJson, Encoding.UTF8, "application/json"),
+        });
 
         using var client = CreateClient(handler);
         var results = await client.RetrieveAsync("test");

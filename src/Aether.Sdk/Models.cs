@@ -69,10 +69,13 @@ public class SearchResult
     public string ContentType { get; set; } = "text/plain";
 
     /// <summary>
-    /// The specific passage (chunk) that matched the query. Fetch the full
-    /// document text with <see cref="AetherClient.DownloadAsync"/> rather than
-    /// inlining it — search never returns full document content.
+    /// Full document content, populated when <c>includeContent</c> was requested
+    /// on the search. Null otherwise.
     /// </summary>
+    [JsonPropertyName("content")]
+    public string? Content { get; set; }
+
+    /// <summary>The specific passage (chunk) that matched the query.</summary>
     [JsonPropertyName("passage")]
     public string? Passage { get; set; }
 
@@ -368,6 +371,9 @@ public class BatchSearchQuery
     [JsonPropertyName("filter")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Dictionary<string, object?>? Filter { get; set; }
+
+    [JsonPropertyName("include_content")]
+    public bool IncludeContent { get; set; }
 
     [JsonPropertyName("entity_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -717,6 +723,9 @@ internal class VectorSearchRequest
 
     [JsonPropertyName("k")]
     public int K { get; set; }
+
+    [JsonPropertyName("include_content")]
+    public bool IncludeContent { get; set; }
 
     [JsonPropertyName("tags")]
     public List<string>? Tags { get; set; }

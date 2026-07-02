@@ -146,6 +146,65 @@ public class MemoryTests
         Assert.Contains("tags=url:https://example.com", query);
     }
 
+    // ── ExtractFacts constructor default + per-call override ───────────────
+
+    private static HttpResponseMessage InsertJson() => Json(new
+    {
+        doc_id = "mem-4",
+        cid = "hash",
+        content_type = "text/plain",
+        size_bytes = 3,
+        chunks = 1,
+        vectors = 1,
+        version = 1,
+    });
+
+    [Fact]
+    public async Task Remember_ConstructorExtractFactsSetsDefault()
+    {
+        var handler = new RoutingHandler((_, __) => InsertJson());
+        var mem = CreateMemory("user-7", handler, new MemoryOptions { ExtractFacts = true });
+
+        await mem.RememberAsync("fact one. fact two.");
+
+        // One insert call carrying extract_facts=true — the fact fan-out is server-side.
+        var req = handler.Requests.Single();
+        Assert.Contains("extract_facts=true", req.Uri.Query);
+    }
+
+    [Fact]
+    public async Task Remember_PerCallExtractFalseOverridesConstructorTrue()
+    {
+        var handler = new RoutingHandler((_, __) => InsertJson());
+        var mem = CreateMemory("user-7", handler, new MemoryOptions { ExtractFacts = true });
+
+        await mem.RememberAsync("fact one. fact two.", extract: false);
+
+        Assert.DoesNotContain("extract_facts", handler.Requests.Single().Uri.Query);
+    }
+
+    [Fact]
+    public async Task Remember_PerCallExtractTrueOverridesDefaultOff()
+    {
+        var handler = new RoutingHandler((_, __) => InsertJson());
+        var mem = CreateMemory("user-7", handler);
+
+        await mem.RememberAsync("fact one. fact two.", extract: true);
+
+        Assert.Contains("extract_facts=true", handler.Requests.Single().Uri.Query);
+    }
+
+    [Fact]
+    public async Task Remember_DefaultOffSendsNoExtractFlag()
+    {
+        var handler = new RoutingHandler((_, __) => InsertJson());
+        var mem = CreateMemory("user-7", handler);
+
+        await mem.RememberAsync("plain memory");
+
+        Assert.DoesNotContain("extract_facts", handler.Requests.Single().Uri.Query);
+    }
+
     [Fact]
     public async Task Remember_RejectsCommaInMetadataValue_NoHttpCall()
     {
@@ -262,33 +321,29 @@ public class MemoryTests
     // ── Case 4: recall default (recencyWeight = 0) ─────────────────────────
 
     [Fact]
-    public async Task Recall_Default_OneSearchCall_NullCreatedAt_ServerOrder()
+    public async Task Recall_Default_OneCall_NullCreatedAt_ServerOrder()
     {
         var handler = new RoutingHandler((m, _) =>
         {
-            var path = PathOf(m.RequestUri!);
-            if (path == "/v1/search")
+            // Only the search/retrieve endpoint should be hit.
+            Assert.Equal("/v1/search", PathOf(m.RequestUri!));
+            return Json(new
             {
-                return Json(new
+                query = "anxiety",
+                results = new[]
                 {
-                    query = "anxiety",
-                    results = new[]
-                    {
-                        new { doc_id = "r1", score = 90, content_type = "text/plain" },
-                        new { doc_id = "r2", score = 80, content_type = "text/plain" },
-                    },
-                });
-            }
-            // Content download per unique hit: /v1/documents/{id}/download.
-            var id = path.Split('/')[3];
-            return Bytes(id == "r1" ? "first" : "second");
+                    new { doc_id = "r1", score = 90, content = "first", content_type = "text/plain" },
+                    new { doc_id = "r2", score = 80, content = "second", content_type = "text/plain" },
+                },
+            });
         });
 
         var mem = CreateMemory("patient-john", handler);
         var hits = await mem.RecallAsync("anxiety", k: 5);
 
-        // §8.4: exactly one search call (plus one text download per unique hit).
-        var req = handler.Requests.Single(r => PathOf(r.Uri) == "/v1/search");
+        // §8.4: exactly one retrieve call.
+        var req = handler.Requests.Single();
+        Assert.Contains("include_content=true", req.Uri.Query);
         Assert.Contains("entity_id=patient-john", req.Uri.Query);
         Assert.Contains("k=5", req.Uri.Query);
 
@@ -360,20 +415,13 @@ public class MemoryTests
                     query = "q",
                     results = new[]
                     {
-                        new { doc_id = "doc-e", score = 95, content_type = "text/plain" },
-                        new { doc_id = "doc-a", score = 90, content_type = "text/plain" },
-                        new { doc_id = "doc-b", score = 80, content_type = "text/plain" },
-                        new { doc_id = "doc-c", score = 70, content_type = "text/plain" },
-                        new { doc_id = "doc-d", score = 60, content_type = "text/plain" },
+                        new { doc_id = "doc-e", score = 95, content = "EEE", content_type = "text/plain" },
+                        new { doc_id = "doc-a", score = 90, content = "AAA", content_type = "text/plain" },
+                        new { doc_id = "doc-b", score = 80, content = "BBB", content_type = "text/plain" },
+                        new { doc_id = "doc-c", score = 70, content = "CCC", content_type = "text/plain" },
+                        new { doc_id = "doc-d", score = 60, content = "DDD", content_type = "text/plain" },
                     },
                 });
-            }
-
-            // download(doc_id) — resolve text per unique hit.
-            if (path.EndsWith("/download"))
-            {
-                var docId = path.Split('/')[3];
-                return Bytes(docId.ToUpperInvariant());
             }
 
             // get(doc_id) — resolve created_at (doc-e has a null timestamp).
@@ -413,11 +461,9 @@ public class MemoryTests
         Assert.Equal("2026-06-14T00:00:00Z", hits[0].CreatedAt);
         Assert.Null(hits[3].CreatedAt); // doc-e: null timestamp echoed through.
 
-        // One /search + one download and one metadata get per unique candidate (5).
+        // N+1: one /search + one /documents/{id} per unique candidate (5).
         Assert.Equal(1, handler.Requests.Count(r => PathOf(r.Uri) == "/v1/search"));
-        Assert.Equal(5, handler.Requests.Count(r => PathOf(r.Uri).EndsWith("/download")));
-        Assert.Equal(5, handler.Requests.Count(r =>
-            PathOf(r.Uri).StartsWith("/v1/documents/") && !PathOf(r.Uri).EndsWith("/download")));
+        Assert.Equal(5, handler.Requests.Count(r => PathOf(r.Uri).StartsWith("/v1/documents/")));
     }
 
     [Fact]
@@ -438,13 +484,11 @@ public class MemoryTests
                 {
                     doc_id = $"d{i}",
                     score = 90 - i,
+                    content = $"c{i}",
                     content_type = "text/plain",
                 }).ToArray();
                 return Json(new { query = "q", results });
             }
-
-            if (path.EndsWith("/download"))
-                return Bytes("c-" + path.Split('/')[3]);
 
             var id = path.Substring("/v1/documents/".Length);
             return Json(new
@@ -502,12 +546,10 @@ public class MemoryTests
                     query = "q",
                     results = new[]
                     {
-                        new { doc_id = "future", score = 5, content_type = "text/plain" },
+                        new { doc_id = "future", score = 5, content = "F", content_type = "text/plain" },
                     },
                 });
             }
-            if (path.EndsWith("/download"))
-                return Bytes("F");
             return Json(new
             {
                 doc_id = "future",
@@ -553,14 +595,11 @@ public class MemoryTests
                     query = "q",
                     results = new[]
                     {
-                        new { doc_id = "dup", score = 90, content_type = "text/plain" },
-                        new { doc_id = "dup", score = 70, content_type = "text/plain" },
+                        new { doc_id = "dup", score = 90, content = "DUP", content_type = "text/plain" },
+                        new { doc_id = "dup", score = 70, content = "DUP", content_type = "text/plain" },
                     },
                 });
             }
-
-            if (path.EndsWith("/download"))
-                return Bytes("DUP");
 
             // get(doc_id) — must be hit only once for the shared "dup" id.
             Interlocked.Increment(ref getCalls);
@@ -591,8 +630,7 @@ public class MemoryTests
         // (the dedup the recency loop relies on), one /search.
         Assert.Equal(1, getCalls);
         Assert.Equal(1, handler.Requests.Count(r => PathOf(r.Uri) == "/v1/search"));
-        Assert.Equal(1, handler.Requests.Count(r =>
-            PathOf(r.Uri).StartsWith("/v1/documents/") && !PathOf(r.Uri).EndsWith("/download")));
+        Assert.Equal(1, handler.Requests.Count(r => PathOf(r.Uri).StartsWith("/v1/documents/")));
 
         // The loop did not crash and every emitted item carries the shared id and the
         // resolved timestamp.
@@ -839,19 +877,13 @@ public class MemoryTests
                     created_at = "2026-06-15T12:00:00Z",
                 });
             }
-            // Content download per unique hit.
-            if (path.EndsWith("/download"))
-                return new HttpResponseMessage(HttpStatusCode.OK)
-                {
-                    Content = new ByteArrayContent(Encoding.UTF8.GetBytes("Anxious about flying")),
-                };
             // /search (recall → retrieve)
             return Json(new
             {
                 query = "anx",
                 results = new[]
                 {
-                    new { doc_id = "mem-1", score = 90, content_type = "text/plain" },
+                    new { doc_id = "mem-1", score = 90, content = "Anxious about flying", content_type = "text/plain" },
                 },
             });
         });

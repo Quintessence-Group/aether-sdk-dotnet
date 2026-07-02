@@ -50,10 +50,11 @@ public class MemoryOptions : AetherClientOptions
     public TimeSpan? HalfLife { get; set; }
 
     /// <summary>
-    /// Enable server-side fact extraction for this Memory's
+    /// Default for server-side fact extraction on this Memory's
     /// <see cref="Memory.RememberAsync"/>: the text is distilled into atomic facts,
     /// each stored as a sibling <c>kind:fact</c> memory and recallable like any
-    /// other. Requires fact extraction to be configured on the node. Default false.
+    /// other. An explicit per-call <c>extract:</c> argument overrides this default.
+    /// Requires fact extraction to be configured on the node. Default false.
     /// </summary>
     public bool ExtractFacts { get; set; }
 
@@ -161,26 +162,35 @@ public class Memory : IDisposable
     /// Optional structured metadata. String-safe values are also mirrored into
     /// legacy <c>key:value</c> tags where doing so is lossless.
     /// </param>
+    /// <param name="extract">
+    /// Per-call override for server-side fact extraction. When <c>null</c>
+    /// (default), the constructor's <see cref="MemoryOptions.ExtractFacts"/>
+    /// flag decides. When extraction runs, the text is distilled into atomic
+    /// facts stored as sibling <c>kind:fact</c> memories; the returned item is
+    /// still the raw memory. Requires fact extraction to be configured on the node.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>A <see cref="MemoryItem"/> built from the inserted document.</returns>
     public async Task<MemoryItem> RememberAsync(
         string text,
         IReadOnlyDictionary<string, object?>? metadata = null,
+        bool? extract = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(text))
             throw new ArgumentException("text cannot be empty", nameof(text));
 
-        // When fact extraction is enabled, the text is distilled server-side
-        // into atomic facts (sibling kind:fact memories); the returned item is
-        // still the raw memory.
+        // The per-call extract argument wins; otherwise the Memory's
+        // ExtractFacts constructor flag is the default. Extraction distills the
+        // text server-side into atomic facts (sibling kind:fact memories); the
+        // returned item is still the raw memory.
         var tags = EncodeMetadata(metadata);
         var record = await _client.InsertTextAsync(
             text,
             tags: tags,
             entityId: _entityId,
             metadata: metadata,
-            extractFacts: _extractFacts,
+            extractFacts: extract ?? _extractFacts,
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
         return new MemoryItem
@@ -199,11 +209,12 @@ public class Memory : IDisposable
     public Task<MemoryItem> RememberAsync(
         string text,
         IReadOnlyDictionary<string, string>? metadata,
+        bool? extract = null,
         CancellationToken cancellationToken = default)
     {
         IReadOnlyDictionary<string, object?>? typed = metadata?
             .ToDictionary(kv => kv.Key, kv => (object?)kv.Value);
-        return RememberAsync(text, typed, cancellationToken);
+        return RememberAsync(text, typed, extract, cancellationToken);
     }
 
     private static IReadOnlyList<string>? EncodeMetadata(IReadOnlyDictionary<string, object?>? metadata)

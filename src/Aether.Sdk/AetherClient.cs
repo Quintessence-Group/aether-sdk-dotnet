@@ -1208,8 +1208,8 @@ public class AetherClient : IDisposable
     }
 
     /// <summary>Search with content retrieval. Results are deduplicated by DocId
-    /// (highest-scoring match wins), then each unique document's full text is
-    /// fetched via <see cref="DownloadAsync"/>.</summary>
+    /// (highest-scoring match wins). Falls back to <see cref="DownloadAsync"/>
+    /// for results missing inline content.</summary>
     /// <param name="query">Natural language search query.</param>
     /// <param name="k">Maximum number of results to return. Default: 5.</param>
     /// <param name="tags">Optional tags to filter results.</param>
@@ -1249,7 +1249,7 @@ public class AetherClient : IDisposable
             throw new ArgumentException("query cannot be empty", nameof(query));
         if (k < 1)
             throw new ArgumentOutOfRangeException(nameof(k), "k must be at least 1");
-        var qs = $"q={Uri.EscapeDataString(query)}&k={k}";
+        var qs = $"q={Uri.EscapeDataString(query)}&k={k}&include_content=true";
         if (tags is { Count: > 0 })
             qs += $"&tags={Uri.EscapeDataString(string.Join(",", tags))}";
         qs = AppendMetadataFilters(qs, anyTags, contentTypes, sources);
@@ -1265,10 +1265,12 @@ public class AetherClient : IDisposable
         {
             if (!seen.Add(r.DocId)) continue;
 
-            // Search returns only the matched passage (never full document
-            // content), so fetch each unique document's text by id for RAG prompts.
-            var bytes = await DownloadAsync(r.DocId, cancellationToken).ConfigureAwait(false);
-            var content = Encoding.UTF8.GetString(bytes);
+            var content = r.Content;
+            if (content == null)
+            {
+                var bytes = await DownloadAsync(r.DocId, cancellationToken).ConfigureAwait(false);
+                content = Encoding.UTF8.GetString(bytes);
+            }
 
             results.Add(new RetrievalResult
             {
@@ -1448,6 +1450,7 @@ public class AetherClient : IDisposable
     /// <summary>Search by raw embedding vector (BYOE — bring your own embeddings).</summary>
     /// <param name="embedding">The query embedding vector.</param>
     /// <param name="k">Maximum number of results to return. Default: 10.</param>
+    /// <param name="includeContent">Whether to include document content in results. Default: false.</param>
     /// <param name="tags">Optional tags to filter results.</param>
     /// <param name="entityId">Only match documents with this entity ID.</param>
     /// <param name="since">Only match documents created at or after this RFC 3339 timestamp (inclusive).</param>
@@ -1465,6 +1468,7 @@ public class AetherClient : IDisposable
     public async Task<List<SearchResult>> SearchByVectorAsync(
         float[] embedding,
         int k = 10,
+        bool includeContent = false,
         IReadOnlyList<string>? tags = null,
         string? entityId = null,
         string? since = null,
@@ -1489,6 +1493,7 @@ public class AetherClient : IDisposable
         {
             Embedding = embedding,
             K = k,
+            IncludeContent = includeContent,
             Tags = tags is { Count: > 0 } ? new List<string>(tags) : null,
             AnyTags = anyTags is { Count: > 0 } ? new List<string>(anyTags) : null,
             ContentTypes = contentTypes is { Count: > 0 } ? new List<string>(contentTypes) : null,
@@ -1646,6 +1651,7 @@ public class AetherClient : IDisposable
                     ContentTypes = q.ContentTypes,
                     Sources = q.Sources,
                     Filter = q.Filter,
+                    IncludeContent = q.IncludeContent,
                     EntityId = q.EntityId,
                     Since = q.Since,
                     Until = q.Until,
