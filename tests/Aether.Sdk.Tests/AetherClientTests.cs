@@ -128,6 +128,80 @@ public class AetherClientTests
         await Assert.ThrowsAsync<AetherNetworkException>(() => client.StatusAsync());
     }
 
+    // Typed billing rejections driven through a real client method.
+    // These exercise the full parse path (read body → deserialize {error,code} →
+    // AetherApiException.FromResponse) on the mocked transport, proving the client
+    // surfaces the typed subclass rather than the base AetherApiException.
+
+    [Fact]
+    public async Task ThrowsCreditExhaustedOn402WithCode()
+    {
+        var handler = MockHttpMessageHandler.WithJson(
+            new
+            {
+                error = "Prepaid credit balance exhausted; top up to continue.",
+                code = "credit_exhausted",
+                request_id = "req-123",
+                resource = "vectors",
+                balance_cents = 0,
+            },
+            (HttpStatusCode)402);
+
+        using var client = CreateClient(handler);
+        var ex = await Assert.ThrowsAsync<CreditExhaustedException>(
+            () => client.InsertTextAsync("hello"));
+
+        Assert.Equal((HttpStatusCode)402, ex.StatusCode);
+        Assert.Equal("credit_exhausted", ex.ErrorCode);
+        Assert.Equal("Prepaid credit balance exhausted; top up to continue.", ex.Body);
+        Assert.False(ex.IsRetryable);
+    }
+
+    [Fact]
+    public async Task ThrowsTenantPausedOn403WithCode()
+    {
+        var handler = MockHttpMessageHandler.WithJson(
+            new
+            {
+                error = "Tenant has been paused by the operator",
+                code = "tenant_paused",
+                request_id = "req-123",
+            },
+            (HttpStatusCode)403);
+
+        using var client = CreateClient(handler);
+        var ex = await Assert.ThrowsAsync<TenantPausedException>(
+            () => client.GetAsync("abc-123"));
+
+        Assert.Equal((HttpStatusCode)403, ex.StatusCode);
+        Assert.Equal("tenant_paused", ex.ErrorCode);
+        Assert.Equal("Tenant has been paused by the operator", ex.Body);
+        Assert.False(ex.IsRetryable);
+    }
+
+    [Fact]
+    public async Task ThrowsFreeLimitExceededOn402WithCode()
+    {
+        var handler = MockHttpMessageHandler.WithJson(
+            new
+            {
+                error = "Free vector limit exceeded (1001/1000)",
+                code = "free_limit_exceeded",
+                request_id = "req-123",
+                limit_type = "vectors",
+                plan = "free",
+            },
+            (HttpStatusCode)402);
+
+        using var client = CreateClient(handler);
+        var ex = await Assert.ThrowsAsync<FreeLimitExceededException>(
+            () => client.InsertTextAsync("hello"));
+
+        Assert.Equal((HttpStatusCode)402, ex.StatusCode);
+        Assert.Equal("free_limit_exceeded", ex.ErrorCode);
+        Assert.IsNotType<CreditExhaustedException>(ex);
+    }
+
     // ── Insert ────────────────────────────────────────────────────
 
     [Fact]
@@ -152,6 +226,99 @@ public class AetherClientTests
         Assert.Contains("content_type=text%2Fplain", handler.LastRequest.RequestUri.Query);
         Assert.Equal("abc-123", result.DocId);
         Assert.Equal(3, result.Chunks);
+    }
+
+    // size_bytes — the insert response carries the full document
+    // record (size_bytes, title, content_type, version). Assert the insert path
+    // parses those fields, not just doc_id/chunks. (Regression: earlier SDK
+    // builds dropped size_bytes on the write path, always returning 0.)
+    [Fact]
+    public async Task Insert_ParsesSizeBytesTitleAndContentType()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "blake3hash",
+            title = "Hello Doc",
+            content_type = "text/plain",
+            size_bytes = 11,
+            chunks = 3,
+            vectors = 3,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        var data = Encoding.UTF8.GetBytes("hello world");
+        var result = await client.InsertAsync(data, "test.txt", "text/plain");
+
+        Assert.Equal(11, result.SizeBytes);
+        Assert.Equal("Hello Doc", result.Title);
+        Assert.Equal("text/plain", result.ContentType);
+        Assert.Equal(1, result.Version);
+    }
+
+    [Fact]
+    public async Task InsertText_ParsesSizeBytes()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "txt-456",
+            cid = "hash",
+            content_type = "text/plain",
+            size_bytes = 9,
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        var result = await client.InsertTextAsync("some text");
+
+        Assert.Equal(9, result.SizeBytes);
+    }
+
+    [Fact]
+    public async Task InsertStreamAsync_ParsesSizeBytes()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "stream-123",
+            cid = "streamhash",
+            content_type = "application/pdf",
+            size_bytes = 13,
+            chunks = 5,
+            vectors = 5,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes("streamed data"));
+        var result = await client.InsertStreamAsync(stream, "upload.pdf", "application/pdf");
+
+        Assert.Equal(13, result.SizeBytes);
+        Assert.Equal("application/pdf", result.ContentType);
+    }
+
+    [Fact]
+    public async Task Update_ParsesSizeBytes()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "newhash",
+            content_type = "text/plain",
+            size_bytes = 7,
+            chunks = 4,
+            vectors = 4,
+            version = 2,
+        });
+
+        using var client = CreateClient(handler);
+        var result = await client.UpdateAsync(
+            "abc-123", Encoding.UTF8.GetBytes("updated"), "test.txt");
+
+        Assert.Equal(7, result.SizeBytes);
+        Assert.Equal(2, result.Version);
     }
 
     [Fact]
@@ -189,6 +356,88 @@ public class AetherClientTests
         await client.InsertAsync(Encoding.UTF8.GetBytes("hello"), "test.txt", "text/plain");
 
         Assert.DoesNotContain("entity_id", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Insert_SendsSource()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertAsync(
+            Encoding.UTF8.GetBytes("hello"), "test.txt", "text/plain", source: "slack");
+
+        Assert.Contains("source=slack", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Insert_OmitsSourceWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertAsync(Encoding.UTF8.GetBytes("hello"), "test.txt", "text/plain");
+
+        Assert.DoesNotContain("source", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    // The insert response echoes the document's tags and source.
+    [Fact]
+    public async Task Insert_ParsesTagsAndSource()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            content_type = "text/plain",
+            size_bytes = 5,
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+            tags = new[] { "a", "b" },
+            source = "notion",
+        });
+
+        using var client = CreateClient(handler);
+        var result = await client.InsertAsync(Encoding.UTF8.GetBytes("hello"), "test.txt", "text/plain");
+
+        Assert.Equal(new[] { "a", "b" }, result.Tags);
+        Assert.Equal("notion", result.Source);
+    }
+
+    [Fact]
+    public async Task Insert_DefaultsTagsToEmptyAndSourceToNull()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            content_type = "text/plain",
+            size_bytes = 5,
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        var result = await client.InsertAsync(Encoding.UTF8.GetBytes("hello"), "test.txt", "text/plain");
+
+        Assert.Empty(result.Tags);
+        Assert.Null(result.Source);
     }
 
     // ── InsertText ────────────────────────────────────────────────
@@ -229,6 +478,24 @@ public class AetherClientTests
         await client.InsertTextAsync("some text", entityId: "user-7");
 
         Assert.Contains("entity_id=user-7", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task InsertText_SendsSource()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "txt-456",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertTextAsync("some text", source: "email");
+
+        Assert.Contains("source=email", handler.LastRequest!.RequestUri!.Query);
     }
 
     // ── InsertStream ─────────────────────────────────────────────
@@ -297,6 +564,25 @@ public class AetherClientTests
     }
 
     [Fact]
+    public async Task InsertStreamAsync_SendsSource()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "stream-123",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes("data"));
+        await client.InsertStreamAsync(stream, "test.txt", "text/plain", source: "upload");
+
+        Assert.Contains("source=upload", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
     public async Task InsertStreamAsync_DoesNotRetry()
     {
         var callCount = 0;
@@ -338,7 +624,7 @@ public class AetherClientTests
             "abc-123", Encoding.UTF8.GetBytes("updated"), "test.txt");
 
         Assert.Equal(HttpMethod.Put, handler.LastRequest!.Method);
-        Assert.Contains("/documents/abc-123", handler.LastRequest.RequestUri!.AbsolutePath);
+        Assert.Contains("/v1/documents/abc-123", handler.LastRequest.RequestUri!.AbsolutePath);
         Assert.Equal(2, result.Version);
     }
 
@@ -359,6 +645,25 @@ public class AetherClientTests
             "abc-123", Encoding.UTF8.GetBytes("updated"), "test.txt", entityId: "acct/42");
 
         Assert.Contains("entity_id=acct%2F42", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Update_SendsSource()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "newhash",
+            chunks = 4,
+            vectors = 4,
+            version = 2,
+        });
+
+        using var client = CreateClient(handler);
+        await client.UpdateAsync(
+            "abc-123", Encoding.UTF8.GetBytes("updated"), "test.txt", source: "slack");
+
+        Assert.Contains("source=slack", handler.LastRequest!.RequestUri!.Query);
     }
 
     // ── Get ───────────────────────────────────────────────────────
@@ -382,7 +687,7 @@ public class AetherClientTests
         using var client = CreateClient(handler);
         var doc = await client.GetAsync("abc-123");
 
-        Assert.Contains("/documents/abc-123", handler.LastRequest!.RequestUri!.AbsolutePath);
+        Assert.Contains("/v1/documents/abc-123", handler.LastRequest!.RequestUri!.AbsolutePath);
         Assert.Equal("Test Doc", doc.Title);
         Assert.Equal(1024, doc.SizeBytes);
     }
@@ -407,6 +712,30 @@ public class AetherClientTests
         var doc = await client.GetAsync("abc-123");
 
         Assert.Equal("acct/42", doc.EntityId);
+    }
+
+    [Fact]
+    public async Task Get_DeserializesTagsAndSource()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            content_type = "text/plain",
+            size_bytes = 1024,
+            chunks = 3,
+            vectors = 3,
+            version = 1,
+            tags = new[] { "x", "y" },
+            source = "notion",
+            created_at = "2026-06-01T00:00:00Z",
+        });
+
+        using var client = CreateClient(handler);
+        var doc = await client.GetAsync("abc-123");
+
+        Assert.Equal(new[] { "x", "y" }, doc.Tags);
+        Assert.Equal("notion", doc.Source);
     }
 
     // ── Download ──────────────────────────────────────────────────
@@ -490,6 +819,77 @@ public class AetherClientTests
         Assert.DoesNotContain("last_n_days", query);
     }
 
+    [Fact]
+    public async Task List_PassesMetadataFilters()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            documents = Array.Empty<object>(),
+            count = 0,
+        });
+
+        using var client = CreateClient(handler);
+        await client.ListAsync(
+            tags: new[] { "must", "have" },
+            anyTags: new[] { "a", "b" },
+            contentTypes: new[] { "text/plain" },
+            sources: new[] { "slack", "notion" });
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("tags=must%2Chave", query);
+        Assert.Contains("any_tags=a%2Cb", query);
+        Assert.Contains("content_type=text%2Fplain", query);
+        Assert.Contains("source=slack%2Cnotion", query);
+    }
+
+    [Fact]
+    public async Task List_OmitsMetadataFiltersWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            documents = Array.Empty<object>(),
+            count = 0,
+        });
+
+        using var client = CreateClient(handler);
+        await client.ListAsync();
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.DoesNotContain("tags=", query);
+        Assert.DoesNotContain("any_tags", query);
+        Assert.DoesNotContain("content_type", query);
+        Assert.DoesNotContain("source", query);
+    }
+
+    [Fact]
+    public async Task List_ParsesTagsAndSourceOnDocuments()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            documents = new[]
+            {
+                new
+                {
+                    doc_id = "a",
+                    cid = "",
+                    content_type = "text/plain",
+                    size_bytes = 100,
+                    version = 1,
+                    tags = new[] { "t1" },
+                    source = "slack",
+                },
+            },
+            count = 1,
+        });
+
+        using var client = CreateClient(handler);
+        var docs = await client.ListAsync();
+
+        Assert.Single(docs.Documents);
+        Assert.Equal(new[] { "t1" }, docs.Documents[0].Tags);
+        Assert.Equal("slack", docs.Documents[0].Source);
+    }
+
     // ── Delete ────────────────────────────────────────────────────
 
     [Fact]
@@ -501,7 +901,22 @@ public class AetherClientTests
         await client.DeleteAsync("abc-123");
 
         Assert.Equal(HttpMethod.Delete, handler.LastRequest!.Method);
-        Assert.Contains("/documents/abc-123", handler.LastRequest.RequestUri!.AbsolutePath);
+        Assert.Contains("/v1/documents/abc-123", handler.LastRequest.RequestUri!.AbsolutePath);
+        Assert.DoesNotContain("hard", handler.LastRequest.RequestUri.Query); // soft by default
+    }
+
+    // HardDeleteAsync issues DELETE with ?hard=true (irreversible purge).
+    [Fact]
+    public async Task HardDelete_SendsHardFlag()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { status = "hard_deleted", doc_id = "abc-123" });
+
+        using var client = CreateClient(handler);
+        await client.HardDeleteAsync("abc-123");
+
+        Assert.Equal(HttpMethod.Delete, handler.LastRequest!.Method);
+        Assert.Contains("/v1/documents/abc-123", handler.LastRequest.RequestUri!.AbsolutePath);
+        Assert.Contains("hard=true", handler.LastRequest.RequestUri.Query);
     }
 
     // ── Restore ───────────────────────────────────────────────────
@@ -515,7 +930,7 @@ public class AetherClientTests
         await client.RestoreAsync("abc-123");
 
         Assert.Equal(HttpMethod.Post, handler.LastRequest!.Method);
-        Assert.Contains("/documents/abc-123/restore", handler.LastRequest.RequestUri!.AbsolutePath);
+        Assert.Contains("/v1/documents/abc-123/restore", handler.LastRequest.RequestUri!.AbsolutePath);
     }
 
     // ── Backfill entity ───────────────────────────────────────────
@@ -538,7 +953,7 @@ public class AetherClientTests
 
         Assert.NotNull(handler.LastRequest);
         Assert.Equal(HttpMethod.Post, handler.LastRequest!.Method);
-        Assert.Equal("/documents/backfill-entity", handler.LastRequest.RequestUri!.AbsolutePath);
+        Assert.Equal("/v1/documents/backfill-entity", handler.LastRequest.RequestUri!.AbsolutePath);
 
         var body = handler.LastRequestBody!;
         Assert.Contains("\"tag_prefix\":\"patient:\"", body);
@@ -668,35 +1083,437 @@ public class AetherClientTests
         Assert.DoesNotContain("max_distance", query);
     }
 
+    [Fact]
+    public async Task Search_PassesMetadataFilters()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchAsync(
+            "test",
+            anyTags: new[] { "a", "b" },
+            contentTypes: new[] { "text/plain", "application/pdf" },
+            sources: new[] { "slack", "notion" });
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("any_tags=a%2Cb", query);
+        Assert.Contains("content_type=text%2Fplain%2Capplication%2Fpdf", query);
+        Assert.Contains("source=slack%2Cnotion", query);
+    }
+
+    [Fact]
+    public async Task Search_OmitsMetadataFiltersWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchAsync("test");
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.DoesNotContain("any_tags", query);
+        Assert.DoesNotContain("content_type", query);
+        Assert.DoesNotContain("source", query);
+    }
+
+    // The search hit echoes tags, source, and created_at.
+    [Fact]
+    public async Task Search_ParsesTagsSourceAndCreatedAt()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            query = "test",
+            results = new[]
+            {
+                new
+                {
+                    doc_id = "abc",
+                    score = 90,
+                    content_type = "text/plain",
+                    tags = new[] { "a", "b" },
+                    source = "slack",
+                    created_at = "2026-06-01T00:00:00Z",
+                },
+            },
+        });
+
+        using var client = CreateClient(handler);
+        var results = await client.SearchAsync("test");
+
+        Assert.Single(results);
+        Assert.Equal(new[] { "a", "b" }, results[0].Tags);
+        Assert.Equal("slack", results[0].Source);
+        Assert.Equal("2026-06-01T00:00:00Z", results[0].CreatedAt);
+    }
+
+    [Fact]
+    public async Task Search_DefaultsTagsToEmptyAndSourceCreatedAtToNull()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            query = "test",
+            results = new[]
+            {
+                new { doc_id = "abc", score = 90, content_type = "text/plain" },
+            },
+        });
+
+        using var client = CreateClient(handler);
+        var results = await client.SearchAsync("test");
+
+        Assert.Single(results);
+        Assert.Empty(results[0].Tags);
+        Assert.Null(results[0].Source);
+        Assert.Null(results[0].CreatedAt);
+    }
+
+    // ── Score + updated_at parsing ─────────────────────────────────
+
+    // The engine serves a calibrated integer `score` (0–100, higher = better)
+    // per hit, plus created_at/updated_at without a second round-trip.
+    [Fact]
+    public async Task Search_ReadsScoreAndTimestamps()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            query = "test",
+            results = new[]
+            {
+                new
+                {
+                    doc_id = "abc",
+                    score = 90,
+                    content_type = "text/plain",
+                    created_at = "2026-06-01T00:00:00Z",
+                    updated_at = "2026-06-15T12:30:00Z",
+                },
+            },
+        });
+
+        using var client = CreateClient(handler);
+        var results = await client.SearchAsync("test");
+
+        Assert.Single(results);
+        Assert.Equal(90, results[0].Score);
+        Assert.Equal("2026-06-01T00:00:00Z", results[0].CreatedAt);
+        Assert.Equal("2026-06-15T12:30:00Z", results[0].UpdatedAt);
+    }
+
+    // The score spans the full 0–100 range; both extremes parse as-is.
+    [Fact]
+    public async Task Search_ParsesFullAndZeroScores()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            query = "test",
+            results = new[]
+            {
+                new { doc_id = "best", score = 100, content_type = "text/plain" },
+                new { doc_id = "worst", score = 0, content_type = "text/plain" },
+            },
+        });
+
+        using var client = CreateClient(handler);
+        var results = await client.SearchAsync("test");
+
+        Assert.Equal(100, results[0].Score);
+        Assert.Equal(0, results[1].Score);
+    }
+
+    // The hit echoes entity_id when the document was written under an entity.
+    [Fact]
+    public async Task Search_ParsesEntityId()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            query = "test",
+            results = new[]
+            {
+                new { doc_id = "abc", score = 90, content_type = "text/plain", entity_id = "acct/42" },
+            },
+        });
+
+        using var client = CreateClient(handler);
+        var results = await client.SearchAsync("test");
+
+        Assert.Single(results);
+        Assert.Equal("acct/42", results[0].EntityId);
+    }
+
+    // The recency knobs are forwarded on the wire as recency_weight / half_life_days
+    // (snake_case), formatted with the invariant culture like max_distance.
+    [Fact]
+    public async Task Search_ForwardsRecencyParams()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchAsync("test", recencyWeight: 0.25, halfLifeDays: 14.5);
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("recency_weight=0.25", query);
+        Assert.Contains("half_life_days=14.5", query);
+    }
+
+    [Fact]
+    public async Task Search_OmitsRecencyParamsWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchAsync("test");
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.DoesNotContain("recency_weight", query);
+        Assert.DoesNotContain("half_life_days", query);
+    }
+
+    [Fact]
+    public async Task Retrieve_ForwardsRecencyParams()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.RetrieveAsync("test", recencyWeight: 0.5, halfLifeDays: 30.0);
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("recency_weight=0.5", query);
+        Assert.Contains("half_life_days=30", query);
+    }
+
+    // The RAG retrieval result carries the score and updated_at.
+    [Fact]
+    public async Task Retrieve_CarriesScoreAndPropagatesUpdatedAt()
+    {
+        var searchJson = JsonSerializer.Serialize(new
+        {
+            query = "test",
+            results = new[]
+            {
+                new
+                {
+                    doc_id = "abc",
+                    score = 80,
+                    content_type = "text/plain",
+                    created_at = "2026-06-01T00:00:00Z",
+                    updated_at = "2026-06-20T09:00:00Z",
+                },
+            },
+        });
+        var handler = new MockHttpMessageHandler(req =>
+            req.RequestUri!.AbsolutePath.EndsWith("/download")
+                ? new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(Encoding.UTF8.GetBytes("full text")),
+                }
+                : new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(searchJson, Encoding.UTF8, "application/json"),
+                });
+
+        using var client = CreateClient(handler);
+        var results = await client.RetrieveAsync("test");
+
+        Assert.Single(results);
+        Assert.Equal(80, results[0].Score);
+        Assert.Equal("full text", results[0].Content);
+        Assert.Equal("2026-06-01T00:00:00Z", results[0].CreatedAt);
+        Assert.Equal("2026-06-20T09:00:00Z", results[0].UpdatedAt);
+    }
+
+    [Fact]
+    public async Task SearchByVector_ForwardsRecencyParamsInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchByVectorAsync(new[] { 0.1f, 0.2f }, recencyWeight: 0.3, halfLifeDays: 7.0);
+
+        var body = handler.LastRequestBody!;
+        Assert.Contains("\"recency_weight\":0.3", body);
+        Assert.Contains("\"half_life_days\":7", body);
+    }
+
+    [Fact]
+    public async Task SearchByVector_OmitsRecencyParamsWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchByVectorAsync(new[] { 0.1f, 0.2f });
+
+        var body = handler.LastRequestBody!;
+        Assert.DoesNotContain("recency_weight", body);
+        Assert.DoesNotContain("half_life_days", body);
+    }
+
+    [Fact]
+    public async Task BatchSearchAsync_ForwardsRecencyParamsInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "test", K = 5, RecencyWeight = 0.4, HalfLifeDays = 10.0 },
+        });
+
+        var body = handler.LastRequestBody!;
+        Assert.Contains("\"recency_weight\":0.4", body);
+        Assert.Contains("\"half_life_days\":10", body);
+    }
+
+    [Fact]
+    public async Task BatchSearchAsync_OmitsRecencyParamsWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "test", K = 5 },
+        });
+
+        var body = handler.LastRequestBody!;
+        Assert.DoesNotContain("recency_weight", body);
+        Assert.DoesNotContain("half_life_days", body);
+    }
+
+    // The freshness knobs are forwarded on the wire as freshness_weight /
+    // freshness_half_life_days (snake_case), the same plumbing as recency.
+    [Fact]
+    public async Task Search_ForwardsFreshnessParams()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchAsync("test", freshnessWeight: 0.25, freshnessHalfLifeDays: 7.5);
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("freshness_weight=0.25", query);
+        Assert.Contains("freshness_half_life_days=7.5", query);
+    }
+
+    [Fact]
+    public async Task Search_OmitsFreshnessParamsWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchAsync("test");
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.DoesNotContain("freshness_weight", query);
+        Assert.DoesNotContain("freshness_half_life_days", query);
+    }
+
+    [Fact]
+    public async Task Retrieve_ForwardsFreshnessParams()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.RetrieveAsync("test", freshnessWeight: 0.5, freshnessHalfLifeDays: 14.0);
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("freshness_weight=0.5", query);
+        Assert.Contains("freshness_half_life_days=14", query);
+    }
+
+    [Fact]
+    public async Task SearchByVector_ForwardsFreshnessParamsInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchByVectorAsync(new[] { 0.1f, 0.2f }, freshnessWeight: 0.3, freshnessHalfLifeDays: 3.0);
+
+        var body = handler.LastRequestBody!;
+        Assert.Contains("\"freshness_weight\":0.3", body);
+        Assert.Contains("\"freshness_half_life_days\":3", body);
+    }
+
+    [Fact]
+    public async Task SearchByVector_OmitsFreshnessParamsWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchByVectorAsync(new[] { 0.1f, 0.2f });
+
+        var body = handler.LastRequestBody!;
+        Assert.DoesNotContain("freshness_weight", body);
+        Assert.DoesNotContain("freshness_half_life_days", body);
+    }
+
+    [Fact]
+    public async Task BatchSearchAsync_ForwardsFreshnessParamsInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "test", K = 5, FreshnessWeight = 0.4, FreshnessHalfLifeDays = 9.0 },
+        });
+
+        var body = handler.LastRequestBody!;
+        Assert.Contains("\"freshness_weight\":0.4", body);
+        Assert.Contains("\"freshness_half_life_days\":9", body);
+    }
+
+    [Fact]
+    public async Task BatchSearchAsync_OmitsFreshnessParamsWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "test", K = 5 },
+        });
+
+        var body = handler.LastRequestBody!;
+        Assert.DoesNotContain("freshness_weight", body);
+        Assert.DoesNotContain("freshness_half_life_days", body);
+    }
+
     // ── Retrieve ──────────────────────────────────────────────────
 
     [Fact]
     public async Task Retrieve_ForwardsFiltersToSearch()
     {
-        // Search now returns only a score + passage; RetrieveAsync always fetches
-        // the full document text by id via /download and attaches it as Content.
+        var searchJson = JsonSerializer.Serialize(new
+        {
+            query = "test",
+            results = new[]
+            {
+                new { doc_id = "abc", score = 90, content_type = "text/plain" },
+            },
+        });
         string? searchQuery = null;
         var handler = new MockHttpMessageHandler(req =>
         {
-            var path = req.RequestUri!.AbsolutePath;
-            if (path.EndsWith("/download"))
+            if (req.RequestUri!.AbsolutePath.EndsWith("/download"))
                 return new HttpResponseMessage(HttpStatusCode.OK)
                 {
-                    Content = new ByteArrayContent(Encoding.UTF8.GetBytes("full document body")),
+                    Content = new ByteArrayContent(Encoding.UTF8.GetBytes("full text")),
                 };
             searchQuery = req.RequestUri.Query;
             return new HttpResponseMessage(HttpStatusCode.OK)
             {
-                Content = new StringContent(
-                    JsonSerializer.Serialize(new
-                    {
-                        query = "test",
-                        results = new[]
-                        {
-                            new { doc_id = "abc", score = 90, passage = "matched chunk", content_type = "text/plain" },
-                        },
-                    }),
-                    Encoding.UTF8, "application/json"),
+                Content = new StringContent(searchJson, Encoding.UTF8, "application/json"),
             };
         });
 
@@ -710,18 +1527,70 @@ public class AetherClientTests
             maxDistance: 0.5f);
 
         Assert.NotNull(searchQuery);
-        Assert.DoesNotContain("include_content", searchQuery);
         Assert.Contains("entity_id=acct%2F42", searchQuery);
         Assert.Contains("since=2026-06-01T00%3A00%3A00Z", searchQuery);
         Assert.Contains("until=2026-06-10T23%3A59%3A59Z", searchQuery);
         Assert.Contains("last_n_days=7", searchQuery);
         Assert.Contains("max_distance=0.5", searchQuery);
-        // The last request is the per-document download.
-        Assert.EndsWith("/documents/abc/download", handler.LastRequest!.RequestUri!.AbsolutePath);
         Assert.Single(results);
-        Assert.Equal(90, results[0].Score);
-        Assert.Equal("matched chunk", results[0].Passage);
-        Assert.Equal("full document body", results[0].Content);
+        Assert.Equal("full text", results[0].Content);
+    }
+
+    [Fact]
+    public async Task Retrieve_PassesMetadataFilters()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.RetrieveAsync(
+            "test",
+            anyTags: new[] { "a" },
+            contentTypes: new[] { "text/plain" },
+            sources: new[] { "slack" });
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("any_tags=a", query);
+        Assert.Contains("content_type=text%2Fplain", query);
+        Assert.Contains("source=slack", query);
+    }
+
+    [Fact]
+    public async Task Retrieve_PropagatesTagsSourceAndCreatedAt()
+    {
+        var searchJson = JsonSerializer.Serialize(new
+        {
+            query = "test",
+            results = new[]
+            {
+                new
+                {
+                    doc_id = "abc",
+                    score = 90,
+                    content_type = "text/plain",
+                    tags = new[] { "a", "b" },
+                    source = "notion",
+                    created_at = "2026-06-01T00:00:00Z",
+                },
+            },
+        });
+        var handler = new MockHttpMessageHandler(req =>
+            req.RequestUri!.AbsolutePath.EndsWith("/download")
+                ? new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new ByteArrayContent(Encoding.UTF8.GetBytes("full text")),
+                }
+                : new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(searchJson, Encoding.UTF8, "application/json"),
+                });
+
+        using var client = CreateClient(handler);
+        var results = await client.RetrieveAsync("test");
+
+        Assert.Single(results);
+        Assert.Equal(new[] { "a", "b" }, results[0].Tags);
+        Assert.Equal("notion", results[0].Source);
+        Assert.Equal("2026-06-01T00:00:00Z", results[0].CreatedAt);
     }
 
     // ── BYOE ──────────────────────────────────────────────────────
@@ -763,6 +1632,84 @@ public class AetherClientTests
         Assert.DoesNotContain("until", body);
         Assert.DoesNotContain("last_n_days", body);
         Assert.DoesNotContain("max_distance", body);
+    }
+
+    // On /search/embed the OR-list filters are sent as JSON arrays.
+    [Fact]
+    public async Task SearchByVector_SendsMetadataFiltersAsArraysInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchByVectorAsync(
+            new[] { 0.1f, 0.2f },
+            anyTags: new[] { "a", "b" },
+            contentTypes: new[] { "text/plain" },
+            sources: new[] { "slack" });
+
+        var body = handler.LastRequestBody!;
+        Assert.Contains("\"any_tags\":[\"a\",\"b\"]", body);
+        Assert.Contains("\"content_type\":[\"text/plain\"]", body);
+        Assert.Contains("\"source\":[\"slack\"]", body);
+    }
+
+    [Fact]
+    public async Task SearchByVector_OmitsMetadataFiltersWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "", results = Array.Empty<object>() });
+
+        using var client = CreateClient(handler);
+        await client.SearchByVectorAsync(new[] { 0.1f, 0.2f });
+
+        var body = handler.LastRequestBody!;
+        Assert.DoesNotContain("any_tags", body);
+        Assert.DoesNotContain("content_type", body);
+        Assert.DoesNotContain("source", body);
+    }
+
+    [Fact]
+    public async Task InsertWithEmbeddings_SendsSourceInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "emb-1",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertWithEmbeddingsAsync(new InsertWithEmbeddingsRequest
+        {
+            Content = "hello",
+            Embedding = new[] { 0.1f, 0.2f },
+            Source = "notion",
+        });
+
+        Assert.Contains("\"source\":\"notion\"", handler.LastRequestBody!);
+    }
+
+    [Fact]
+    public async Task InsertWithEmbeddings_OmitsSourceWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "emb-1",
+            cid = "hash",
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+        using var client = CreateClient(handler);
+        await client.InsertWithEmbeddingsAsync(new InsertWithEmbeddingsRequest
+        {
+            Content = "hello",
+            Embedding = new[] { 0.1f, 0.2f },
+        });
+
+        Assert.DoesNotContain("source", handler.LastRequestBody!);
     }
 
     [Fact]
@@ -923,71 +1870,7 @@ public class AetherClientTests
         Assert.Equal("b1", docs[0].DocId);
         Assert.NotNull(handler.LastRequest);
         Assert.Equal(HttpMethod.Post, handler.LastRequest!.Method);
-        Assert.Contains("/documents/batch", handler.LastRequest.RequestUri!.ToString());
-    }
-
-    [Fact]
-    public async Task BatchInsertAsync_SendsTagsAsCommaJoinedString()
-    {
-        // Capture the request body up front: the handler buffers content into a
-        // rebuilt ByteArrayContent, but we read it synchronously to be safe.
-        string? capturedBody = null;
-        var handler = new MockHttpMessageHandler(req =>
-        {
-            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
-            return new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent(
-                    JsonSerializer.Serialize(new
-                    {
-                        results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1 } },
-                    }),
-                    Encoding.UTF8, "application/json"),
-            };
-        });
-        var client = CreateClient(handler);
-
-        await client.BatchInsertAsync(new List<BatchInsertItem>
-        {
-            new() { Filename = "a.txt", Content = "hello", Tags = new List<string> { "x", "y" } },
-        });
-
-        Assert.NotNull(capturedBody);
-        using var doc = JsonDocument.Parse(capturedBody!);
-        var tags = doc.RootElement.GetProperty("documents")[0].GetProperty("tags");
-        // Must be a comma-joined STRING, not a JSON array (prod rejects the array with 422).
-        Assert.Equal(JsonValueKind.String, tags.ValueKind);
-        Assert.Equal("x,y", tags.GetString());
-    }
-
-    [Fact]
-    public async Task BatchInsertAsync_OmitsTagsWhenNone()
-    {
-        string? capturedBody = null;
-        var handler = new MockHttpMessageHandler(req =>
-        {
-            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
-            return new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent(
-                    JsonSerializer.Serialize(new
-                    {
-                        results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1 } },
-                    }),
-                    Encoding.UTF8, "application/json"),
-            };
-        });
-        var client = CreateClient(handler);
-
-        await client.BatchInsertAsync(new List<BatchInsertItem>
-        {
-            new() { Filename = "a.txt", Content = "hello" },
-        });
-
-        Assert.NotNull(capturedBody);
-        using var doc = JsonDocument.Parse(capturedBody!);
-        var item = doc.RootElement.GetProperty("documents")[0];
-        Assert.False(item.TryGetProperty("tags", out _));
+        Assert.Contains("/v1/documents/batch", handler.LastRequest.RequestUri!.ToString());
     }
 
     [Fact]
@@ -1025,34 +1908,37 @@ public class AetherClientTests
     }
 
     [Fact]
-    public async Task BatchSearchAsync_SendsTagsAsCommaJoinedString()
+    public async Task BatchInsertAsync_SendsSourceInBody()
     {
-        string? capturedBody = null;
-        var handler = new MockHttpMessageHandler(req =>
+        var handler = MockHttpMessageHandler.WithJson(new
         {
-            capturedBody = req.Content!.ReadAsStringAsync().GetAwaiter().GetResult();
-            return new HttpResponseMessage(HttpStatusCode.OK)
-            {
-                Content = new StringContent(
-                    JsonSerializer.Serialize(new
-                    {
-                        results = new[] { new { query = "test", results = Array.Empty<object>() } },
-                    }),
-                    Encoding.UTF8, "application/json"),
-            };
+            results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1, content_type = "text/plain", size_bytes = 5 } },
         });
         var client = CreateClient(handler);
 
-        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        await client.BatchInsertAsync(new List<BatchInsertItem>
         {
-            new() { Q = "test", K = 5, Tags = new List<string> { "alpha", "beta" } },
+            new() { Filename = "a.txt", Content = "hello", Source = "slack" },
         });
 
-        Assert.NotNull(capturedBody);
-        using var doc = JsonDocument.Parse(capturedBody!);
-        var tags = doc.RootElement.GetProperty("queries")[0].GetProperty("tags");
-        Assert.Equal(JsonValueKind.String, tags.ValueKind);
-        Assert.Equal("alpha,beta", tags.GetString());
+        Assert.Contains("\"source\":\"slack\"", handler.LastRequestBody!);
+    }
+
+    [Fact]
+    public async Task BatchInsertAsync_OmitsSourceWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1, content_type = "text/plain", size_bytes = 5 } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchInsertAsync(new List<BatchInsertItem>
+        {
+            new() { Filename = "a.txt", Content = "hello" },
+        });
+
+        Assert.DoesNotContain("source", handler.LastRequestBody!);
     }
 
     [Fact]
@@ -1126,30 +2012,112 @@ public class AetherClientTests
         Assert.DoesNotContain("max_distance", body);
     }
 
+    // On /search/batch the per-query metadata filters are sent as comma-joined
+    // strings, the same CSV convention as the GET /search query params (the
+    // engine deserializes each batch filter, tags included, as a single string).
+    [Fact]
+    public async Task BatchSearchAsync_SendsMetadataFiltersAsCsvInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new()
+            {
+                Q = "test",
+                K = 5,
+                Tags = new List<string> { "must", "have" },
+                AnyTags = new List<string> { "a", "b" },
+                ContentTypes = new List<string> { "text/plain", "application/pdf" },
+                Sources = new List<string> { "slack", "notion" },
+            },
+        });
+
+        var body = handler.LastRequestBody!;
+        Assert.Contains("\"tags\":\"must,have\"", body);
+        Assert.Contains("\"any_tags\":\"a,b\"", body);
+        Assert.Contains("\"content_type\":\"text/plain,application/pdf\"", body);
+        Assert.Contains("\"source\":\"slack,notion\"", body);
+        // Must be a CSV string, never a JSON array — the engine takes Option<String>.
+        Assert.DoesNotContain("\"tags\":[", body);
+    }
+
+    [Fact]
+    public async Task BatchSearchAsync_OmitsTagsWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "test", K = 5 },
+        });
+
+        Assert.DoesNotContain("\"tags\"", handler.LastRequestBody!);
+    }
+
+    [Fact]
+    public async Task BatchSearchAsync_OmitsMetadataFiltersWhenUnset()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        var client = CreateClient(handler);
+
+        await client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "test", K = 5 },
+        });
+
+        var body = handler.LastRequestBody!;
+        Assert.DoesNotContain("any_tags", body);
+        Assert.DoesNotContain("content_type", body);
+        Assert.DoesNotContain("source", body);
+    }
+
     // ── Async job operations ─────────────────────────────────────────
 
     [Fact]
     public async Task EnqueueDocumentAsync_SendsCorrectRequest()
     {
-        var handler = MockHttpMessageHandler.WithJson(new { job_id = "j1", status = "pending", poll_url = "/documents/jobs/j1" });
+        var handler = MockHttpMessageHandler.WithJson(new { job_id = "j1", status = "pending", poll_url = "/v1/documents/jobs/j1" });
         var client = CreateClient(handler);
 
         var result = await client.EnqueueDocumentAsync(new byte[] { 1, 2, 3 }, "test.bin");
 
         Assert.Equal("j1", result.JobId);
         Assert.NotNull(handler.LastRequest);
-        Assert.Contains("/documents/async", handler.LastRequest!.RequestUri!.ToString());
+        Assert.Contains("/v1/documents/async", handler.LastRequest!.RequestUri!.ToString());
     }
 
     [Fact]
     public async Task EnqueueDocumentAsync_SendsEntityId()
     {
-        var handler = MockHttpMessageHandler.WithJson(new { job_id = "j1", status = "pending", poll_url = "/documents/jobs/j1" });
+        var handler = MockHttpMessageHandler.WithJson(new { job_id = "j1", status = "pending", poll_url = "/v1/documents/jobs/j1" });
         var client = CreateClient(handler);
 
         await client.EnqueueDocumentAsync(new byte[] { 1, 2, 3 }, "test.bin", entityId: "acct/42");
 
         Assert.Contains("entity_id=acct%2F42", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task EnqueueDocumentAsync_SendsSource()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { job_id = "j1", status = "pending", poll_url = "/v1/documents/jobs/j1" });
+        var client = CreateClient(handler);
+
+        await client.EnqueueDocumentAsync(new byte[] { 1, 2, 3 }, "test.bin", source: "slack");
+
+        Assert.Contains("source=slack", handler.LastRequest!.RequestUri!.Query);
     }
 
     // ── Input validation ─────────────────────────────────────────────
@@ -1192,5 +2160,348 @@ public class AetherClientTests
         var handler = MockHttpMessageHandler.WithJson(new { });
         var client = CreateClient(handler);
         await Assert.ThrowsAsync<ArgumentException>(() => client.BatchSearchAsync(new List<BatchSearchQuery>()));
+    }
+
+    // ── Partition scoping ────────────────────────────────────
+
+    private static MockHttpMessageHandler InsertOkHandler() =>
+        MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "p-1",
+            cid = "hash",
+            content_type = "text/plain",
+            size_bytes = 5,
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+
+    [Fact]
+    public void Partition_ReturnsDistinctScopedClient_OriginalStaysUnscoped()
+    {
+        var handler = InsertOkHandler();
+        using var client = CreateClient(handler);
+
+        var scoped = client.Partition("tenant-x");
+
+        Assert.NotSame(client, scoped);
+        Assert.IsType<AetherClient>(scoped);
+    }
+
+    [Fact]
+    public async Task Partition_OriginalClientSendsNoPartition()
+    {
+        // The unscoped parent must behave byte-identically to today: no partition param.
+        var handler = InsertOkHandler();
+        using var client = CreateClient(handler);
+        _ = client.Partition("tenant-x"); // deriving a handle must not mutate the parent
+
+        await client.InsertTextAsync("hello");
+
+        Assert.DoesNotContain("partition", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_Search_SendsPartitionQueryParam()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").SearchAsync("test");
+
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_InsertText_SendsPartitionQueryParam()
+    {
+        var handler = InsertOkHandler();
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").InsertTextAsync("hello");
+
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_Insert_SendsPartitionQueryParam()
+    {
+        var handler = InsertOkHandler();
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").InsertAsync(
+            Encoding.UTF8.GetBytes("hello"), "a.txt", "text/plain");
+
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_InsertStream_SendsPartitionQueryParam()
+    {
+        var handler = InsertOkHandler();
+        using var client = CreateClient(handler);
+
+        using var stream = new MemoryStream(Encoding.UTF8.GetBytes("data"));
+        await client.Partition("tenant-x").InsertStreamAsync(stream, "a.bin");
+
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_Update_SendsPartitionQueryParam()
+    {
+        var handler = InsertOkHandler();
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").UpdateAsync(
+            "abc-123", Encoding.UTF8.GetBytes("updated"), "a.txt");
+
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_Enqueue_SendsPartitionQueryParam()
+    {
+        var handler = MockHttpMessageHandler.WithJson(
+            new { job_id = "j1", status = "pending", poll_url = "/v1/documents/jobs/j1" });
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").EnqueueDocumentAsync(new byte[] { 1, 2, 3 }, "a.bin");
+
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_List_SendsPartitionQueryParam()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { documents = Array.Empty<object>(), count = 0 });
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").ListAsync();
+
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_Retrieve_SendsPartitionQueryParam()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").RetrieveAsync("test");
+
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_UrlEncodesValue()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+        using var client = CreateClient(handler);
+
+        await client.Partition("acme/eu").SearchAsync("test");
+
+        // Same encoding as entity_id ('/' → %2F).
+        Assert.Contains("partition=acme%2Feu", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_SearchByVector_SendsPartitionInBody()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "", results = Array.Empty<object>() });
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").SearchByVectorAsync(new[] { 0.1f, 0.2f });
+
+        Assert.Contains("\"partition\":\"tenant-x\"", handler.LastRequestBody!);
+    }
+
+    [Fact]
+    public async Task Partition_InsertWithEmbeddings_SendsPartitionInBody()
+    {
+        var handler = InsertOkHandler();
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").InsertWithEmbeddingsAsync(new InsertWithEmbeddingsRequest
+        {
+            Content = "hello",
+            Embedding = new[] { 0.1f, 0.2f },
+        });
+
+        Assert.Contains("\"partition\":\"tenant-x\"", handler.LastRequestBody!);
+    }
+
+    [Fact]
+    public async Task Partition_BatchInsert_SendsPartitionOnEveryItem()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1, content_type = "text/plain", size_bytes = 5 } },
+        });
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").BatchInsertAsync(new List<BatchInsertItem>
+        {
+            new() { Filename = "a.txt", Content = "hello" },
+            new() { Filename = "b.txt", Content = "world" },
+        });
+
+        // Same partition appears once per item.
+        var body = handler.LastRequestBody!;
+        var occurrences = body.Split(new[] { "\"partition\":\"tenant-x\"" }, StringSplitOptions.None).Length - 1;
+        Assert.Equal(2, occurrences);
+    }
+
+    [Fact]
+    public async Task Partition_BatchSearch_SendsPartitionOnEveryQuery()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "test", results = Array.Empty<object>() } },
+        });
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "a", K = 5 },
+            new() { Q = "b", K = 5 },
+        });
+
+        var body = handler.LastRequestBody!;
+        var occurrences = body.Split(new[] { "\"partition\":\"tenant-x\"" }, StringSplitOptions.None).Length - 1;
+        Assert.Equal(2, occurrences);
+    }
+
+    [Fact]
+    public async Task Partition_Batch_DoesNotMutateCallerItems()
+    {
+        // A scoped batch call must not write partition onto the caller's input
+        // objects — projecting into fresh wire items keeps a reused list usable
+        // on an unscoped client afterward (parity with Python/TS/Go).
+        var insertHandler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { doc_id = "b1", cid = "c1", chunks = 1, vectors = 1, version = 1, content_type = "text/plain", size_bytes = 5 } },
+        });
+        using var client = CreateClient(insertHandler);
+
+        var items = new List<BatchInsertItem>
+        {
+            new() { Filename = "a.txt", Content = "hello" },
+            new() { Filename = "b.txt", Content = "world" },
+        };
+        await client.Partition("tenant-x").BatchInsertAsync(items);
+        Assert.All(items, i => Assert.Null(i.Partition));
+
+        var queries = new List<BatchSearchQuery> { new() { Q = "a", K = 5 } };
+        var searchHandler = MockHttpMessageHandler.WithJson(new
+        {
+            results = new[] { new { query = "a", results = Array.Empty<object>() } },
+        });
+        using var searchClient = CreateClient(searchHandler);
+        await searchClient.Partition("tenant-x").BatchSearchAsync(queries);
+        Assert.All(queries, q => Assert.Null(q.Partition));
+    }
+
+    [Fact]
+    public async Task Partition_DocIdMethods_SendNoPartition_Get()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            content_type = "text/plain",
+            size_bytes = 1,
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+        });
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").GetAsync("abc-123");
+
+        Assert.DoesNotContain("partition", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task Partition_DocIdMethods_SendNoPartition_Delete()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { status = "tombstoned", doc_id = "abc-123" });
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").DeleteAsync("abc-123");
+
+        Assert.DoesNotContain("partition", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public void Partition_RejectsEmpty_NoHttpCall()
+    {
+        var calls = 0;
+        var handler = new MockHttpMessageHandler(_ =>
+        {
+            calls++;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+            };
+        });
+        using var client = CreateClient(handler);
+
+        Assert.Throws<ArgumentException>(() => client.Partition(""));
+        Assert.Throws<ArgumentException>(() => client.Partition("   "));
+        Assert.Equal(0, calls);
+    }
+
+    [Fact]
+    public void Partition_RejectsTooLong_NoHttpCall()
+    {
+        var calls = 0;
+        var handler = new MockHttpMessageHandler(_ =>
+        {
+            calls++;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+            };
+        });
+        using var client = CreateClient(handler);
+
+        Assert.Throws<ArgumentException>(() => client.Partition(new string('a', 257)));
+        // 256 is the inclusive upper bound and must be accepted.
+        var ok = client.Partition(new string('a', 256));
+        Assert.NotNull(ok);
+        Assert.Equal(0, calls);
+    }
+
+    [Fact]
+    public async Task Partition_LastWins_OnRescoping()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+        using var client = CreateClient(handler);
+
+        await client.Partition("a").Partition("b").SearchAsync("test");
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("partition=b", query);
+        Assert.DoesNotContain("partition=a", query);
+    }
+
+    [Fact]
+    public async Task Partition_DisposingScopedHandle_DoesNotCloseSharedTransport()
+    {
+        // The scoped clone shares the parent's HttpClient and must not close it on
+        // Dispose(); the parent stays fully usable afterward.
+        var handler = MockHttpMessageHandler.WithJson(new { query = "test", results = Array.Empty<object>() });
+        var http = new HttpClient(handler);
+        var parent = new AetherClient(http, "http://localhost:9000");
+
+        var scoped = parent.Partition("tenant-x");
+        scoped.Dispose();
+
+        // If Dispose() had closed the shared HttpClient, this would throw ObjectDisposedException.
+        await parent.SearchAsync("test");
+        Assert.Contains("q=test", handler.LastRequest!.RequestUri!.Query);
+
+        parent.Dispose();
     }
 }

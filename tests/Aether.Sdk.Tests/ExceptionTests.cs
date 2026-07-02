@@ -86,6 +86,77 @@ public class ExceptionTests
         Assert.Equal(typeof(AetherApiException), ex.GetType());
     }
 
+    // Canonical billing-rejection fixtures. The (status, code)
+    // pairs and bodies below mirror the exact wire shapes the engine emits for
+    // billing rejections; FromResponse must map each pair to its typed subclass
+    // with StatusCode/ErrorCode populated, and fall back to the base type for an
+    // unknown code on the same status.
+
+    [Fact]
+    public void FromResponse_MapsCanonicalTenantPausedBody()
+    {
+        const string body =
+            "{\"error\":\"Tenant has been paused by the operator\",\"code\":\"tenant_paused\",\"request_id\":\"req-123\"}";
+
+        var ex = AetherApiException.FromResponse((HttpStatusCode)403, body, "tenant_paused");
+
+        Assert.IsType<TenantPausedException>(ex);
+        Assert.IsAssignableFrom<AetherApiException>(ex);
+        Assert.Equal((HttpStatusCode)403, ex.StatusCode);
+        Assert.Equal("tenant_paused", ex.ErrorCode);
+        Assert.Equal(body, ex.Body);
+        Assert.False(ex.IsRetryable);
+    }
+
+    [Fact]
+    public void FromResponse_MapsCanonicalCreditExhaustedBody()
+    {
+        const string body =
+            "{\"error\":\"Prepaid credit balance exhausted; top up to continue.\",\"code\":\"credit_exhausted\",\"request_id\":\"req-123\",\"resource\":\"vectors\",\"balance_cents\":0}";
+
+        var ex = AetherApiException.FromResponse((HttpStatusCode)402, body, "credit_exhausted");
+
+        Assert.IsType<CreditExhaustedException>(ex);
+        Assert.IsAssignableFrom<AetherApiException>(ex);
+        Assert.Equal((HttpStatusCode)402, ex.StatusCode);
+        Assert.Equal("credit_exhausted", ex.ErrorCode);
+        Assert.Equal(body, ex.Body);
+        Assert.False(ex.IsRetryable);
+    }
+
+    [Fact]
+    public void FromResponse_MapsCanonicalFreeLimitExceededBody()
+    {
+        const string body =
+            "{\"error\":\"Free vector limit exceeded (1001/1000)\",\"code\":\"free_limit_exceeded\",\"request_id\":\"req-123\",\"limit_type\":\"vectors\",\"plan\":\"free\"}";
+
+        var ex = AetherApiException.FromResponse((HttpStatusCode)402, body, "free_limit_exceeded");
+
+        Assert.IsType<FreeLimitExceededException>(ex);
+        Assert.IsAssignableFrom<AetherApiException>(ex);
+        // Sibling of CreditExhaustedException, not a subclass — they must stay distinct.
+        Assert.IsNotType<CreditExhaustedException>(ex);
+        Assert.Equal((HttpStatusCode)402, ex.StatusCode);
+        Assert.Equal("free_limit_exceeded", ex.ErrorCode);
+        Assert.Equal(body, ex.Body);
+        Assert.False(ex.IsRetryable);
+    }
+
+    [Fact]
+    public void FromResponse_UnknownCodeFallsBackToBaseWithFieldsPopulated()
+    {
+        const string body =
+            "{\"error\":\"Some other billing failure\",\"code\":\"mystery_code\",\"request_id\":\"req-123\"}";
+
+        var ex = AetherApiException.FromResponse((HttpStatusCode)402, body, "mystery_code");
+
+        // Exactly the base type — no subclass.
+        Assert.Equal(typeof(AetherApiException), ex.GetType());
+        Assert.Equal((HttpStatusCode)402, ex.StatusCode);
+        Assert.Equal("mystery_code", ex.ErrorCode);
+        Assert.Equal(body, ex.Body);
+    }
+
     [Theory]
     [InlineData(429, true)]
     [InlineData(502, true)]

@@ -56,6 +56,7 @@ public class AetherApiException : AetherException
             (402, "credit_exhausted") => new CreditExhaustedException(statusCode, body, errorCode),
             (402, "free_limit_exceeded") => new FreeLimitExceededException(statusCode, body, errorCode),
             (403, "tenant_paused") => new TenantPausedException(statusCode, body, errorCode),
+            (400, "partition_required") => new PartitionRequiredException(statusCode, body, errorCode),
             _ => new AetherApiException(statusCode, body, errorCode),
         };
     }
@@ -93,6 +94,20 @@ public class FreeLimitExceededException : AetherApiException
 public class TenantPausedException : AetherApiException
 {
     public TenantPausedException(HttpStatusCode statusCode, string body, string? errorCode = null)
+        : base(statusCode, body, errorCode) { }
+}
+
+/// <summary>
+/// Thrown when a multi-tenant key makes an unscoped call (HTTP 400,
+/// <c>code = "partition_required"</c>). The key requires every read and write to
+/// name a partition; scope the call through a partition handle —
+/// <see cref="AetherClient.Partition"/> (e.g. <c>client.Partition("&lt;end-client-id&gt;")</c>)
+/// — instead of the top-level client. Not retryable: it is a programming error,
+/// not a transient failure.
+/// </summary>
+public class PartitionRequiredException : AetherApiException
+{
+    public PartitionRequiredException(HttpStatusCode statusCode, string body, string? errorCode = null)
         : base(statusCode, body, errorCode) { }
 }
 
