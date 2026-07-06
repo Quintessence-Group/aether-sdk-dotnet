@@ -7,9 +7,11 @@ namespace Aether.Sdk.Tests;
 
 /// <summary>
 /// Partition lifecycle (list / delete), provable isolation (trace /
-/// verify-isolation), and the partition_required typed exception. Each test
-/// drives a real client over the mocked transport so the genuine request /
-/// parse / error-mapping path runs (mirrors sdk/python/tests/test_partitions.py).
+/// verify-isolation), the partition guard on doc_id-addressed routes, the
+/// explicit move, the partition echo on responses, and the partition_required
+/// typed exception. Each test drives a real client over the mocked transport
+/// so the genuine request / parse / error-mapping path runs (mirrors
+/// sdk/python/tests/test_partitions.py).
 /// </summary>
 public class PartitionLifecycleTests
 {
@@ -291,7 +293,389 @@ public class PartitionLifecycleTests
             () => client.VerifyIsolationAsync("returns policy"));
     }
 
+    // ── Partition guard on doc_id-addressed routes ───────────────────
+
+    private static MockHttpMessageHandler DocRecordHandler(string? partition = null) =>
+        MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            content_type = "text/plain",
+            size_bytes = 5,
+            chunks = 1,
+            vectors = 1,
+            version = 1,
+            partition,
+        });
+
+    [Fact]
+    public async Task PartitionGuard_Get_InjectsPartition()
+    {
+        var handler = DocRecordHandler("client-a");
+        using var client = CreateClient(handler);
+
+        await client.Partition("client-a").GetAsync("abc-123");
+
+        Assert.Equal("/v1/documents/abc-123", handler.LastRequest!.RequestUri!.AbsolutePath);
+        Assert.Contains("partition=client-a", handler.LastRequest.RequestUri.Query);
+    }
+
+    [Fact]
+    public async Task PartitionGuard_Download_InjectsPartition()
+    {
+        var handler = MockHttpMessageHandler.WithBytes(Encoding.UTF8.GetBytes("hello"));
+        using var client = CreateClient(handler);
+
+        await client.Partition("client-a").DownloadAsync("abc-123");
+
+        Assert.Equal("/v1/documents/abc-123/download", handler.LastRequest!.RequestUri!.AbsolutePath);
+        Assert.Contains("partition=client-a", handler.LastRequest.RequestUri.Query);
+    }
+
+    [Fact]
+    public async Task PartitionGuard_SoftDelete_InjectsPartition()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { status = "tombstoned", doc_id = "abc-123" });
+        using var client = CreateClient(handler);
+
+        await client.Partition("client-a").DeleteAsync("abc-123");
+
+        Assert.Equal(HttpMethod.Delete, handler.LastRequest!.Method);
+        Assert.Contains("partition=client-a", handler.LastRequest.RequestUri!.Query);
+        Assert.DoesNotContain("hard", handler.LastRequest.RequestUri.Query);
+    }
+
+    [Fact]
+    public async Task PartitionGuard_HardDelete_InjectsPartitionAlongsideHardFlag()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { status = "deleted", doc_id = "abc-123" });
+        using var client = CreateClient(handler);
+
+        await client.Partition("client-a").HardDeleteAsync("abc-123");
+
+        var query = handler.LastRequest!.RequestUri!.Query;
+        Assert.Contains("hard=true", query);
+        Assert.Contains("partition=client-a", query);
+    }
+
+    [Fact]
+    public async Task PartitionGuard_Restore_InjectsPartition()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { status = "restored", doc_id = "abc-123" });
+        using var client = CreateClient(handler);
+
+        await client.Partition("client-a").RestoreAsync("abc-123");
+
+        Assert.Equal("/v1/documents/abc-123/restore", handler.LastRequest!.RequestUri!.AbsolutePath);
+        Assert.Contains("partition=client-a", handler.LastRequest.RequestUri.Query);
+    }
+
+    [Fact]
+    public async Task PartitionGuard_BackfillEntity_InjectsPartition()
+    {
+        // The backfill scan is partition-constrained under a handle (a
+        // multi-tenant key requires it).
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            scanned = 0,
+            updated = 0,
+            skipped_existing = 0,
+            skipped_no_match = 0,
+            skipped_ambiguous = 0,
+            skipped_invalid = 0,
+        });
+        using var client = CreateClient(handler);
+
+        await client.Partition("client-a").BackfillEntityFromTagsAsync("patient:");
+
+        Assert.Contains("partition=client-a", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task PartitionGuard_UnscopedClient_SendsNone()
+    {
+        // Bare doc-id calls on the unscoped client are byte-identical to the
+        // pre-guard behavior: no partition param on any by-ID route.
+        var handler = DocRecordHandler();
+        using var client = CreateClient(handler);
+
+        await client.GetAsync("abc-123");
+        Assert.DoesNotContain("partition", handler.LastRequest!.RequestUri!.Query);
+
+        await client.DeleteAsync("abc-123");
+        Assert.DoesNotContain("partition", handler.LastRequest!.RequestUri!.Query);
+
+        await client.RestoreAsync("abc-123");
+        Assert.DoesNotContain("partition", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task PartitionGuard_UrlEncodesValue()
+    {
+        var handler = DocRecordHandler("acme/eu");
+        using var client = CreateClient(handler);
+
+        await client.Partition("acme/eu").GetAsync("abc-123");
+
+        // Same encoding as entity_id ('/' → %2F).
+        Assert.Contains("partition=acme%2Feu", handler.LastRequest!.RequestUri!.Query);
+    }
+
+    [Fact]
+    public async Task PartitionGuard_Mismatch_SurfacesGenuineMiss404()
+    {
+        // A wrong guard is byte-identical to a nonexistent id — never a
+        // partition-existence oracle.
+        var handler = MockHttpMessageHandler.WithJson(
+            new { error = "document not found: abc-123", code = "document_not_found" },
+            HttpStatusCode.NotFound);
+        using var client = CreateClient(handler);
+
+        var ex = await Assert.ThrowsAsync<AetherApiException>(
+            () => client.Partition("client-b").GetAsync("abc-123"));
+
+        Assert.Equal(HttpStatusCode.NotFound, ex.StatusCode);
+        Assert.Equal("document_not_found", ex.ErrorCode);
+    }
+
+    // ── MoveDocument ─────────────────────────────────────────────────
+
+    [Fact]
+    public async Task Move_PostsBothFieldsAndReturnsUpdatedRecord()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            cid = "hash",
+            content_type = "text/plain",
+            size_bytes = 5,
+            chunks = 1,
+            vectors = 1,
+            version = 2,
+            partition = "client-b",
+        });
+        using var client = CreateClient(handler);
+
+        var record = await client.MoveDocumentAsync("abc-123", "client-a", "client-b");
+
+        Assert.Equal(HttpMethod.Post, handler.LastRequest!.Method);
+        Assert.Equal("/v1/documents/abc-123/move", handler.LastRequest.RequestUri!.AbsolutePath);
+
+        using var body = JsonDocument.Parse(handler.LastRequestBody!);
+        Assert.Equal("client-b", body.RootElement.GetProperty("to_partition").GetString());
+        Assert.Equal("client-a", body.RootElement.GetProperty("expect_partition").GetString());
+
+        // The response echoes the new home; version incremented on a real move.
+        Assert.Equal("client-b", record.Partition);
+        Assert.Equal(2, record.Version);
+    }
+
+    [Fact]
+    public async Task Move_NullNamesTheDefaultPartition_ExplicitNullOnWire()
+    {
+        // Both keys must always be PRESENT: an explicit JSON null names the
+        // default partition (an omitted key is a server-side 400).
+        var handler = DocRecordHandler("client-b");
+        using var client = CreateClient(handler);
+
+        await client.MoveDocumentAsync("abc-123", null, "client-b");
+
+        using (var body = JsonDocument.Parse(handler.LastRequestBody!))
+        {
+            Assert.Equal(JsonValueKind.Null, body.RootElement.GetProperty("expect_partition").ValueKind);
+            Assert.Equal("client-b", body.RootElement.GetProperty("to_partition").GetString());
+        }
+
+        await client.MoveDocumentAsync("abc-123", "client-a", null);
+
+        using (var body = JsonDocument.Parse(handler.LastRequestBody!))
+        {
+            Assert.Equal("client-a", body.RootElement.GetProperty("expect_partition").GetString());
+            Assert.Equal(JsonValueKind.Null, body.RootElement.GetProperty("to_partition").ValueKind);
+        }
+    }
+
+    [Fact]
+    public async Task Move_NotAutoScopedByHandle()
+    {
+        // A relocating call names its partitions explicitly (like
+        // DeletePartition): the handle injects nothing into the move.
+        var handler = DocRecordHandler("client-b");
+        using var client = CreateClient(handler);
+
+        await client.Partition("tenant-x").MoveDocumentAsync("abc-123", null, "client-b");
+
+        Assert.DoesNotContain("partition", handler.LastRequest!.RequestUri!.Query);
+        using var body = JsonDocument.Parse(handler.LastRequestBody!);
+        // The handle's scope must not overwrite the explicit (null) assertion.
+        Assert.Equal(JsonValueKind.Null, body.RootElement.GetProperty("expect_partition").ValueKind);
+        Assert.Equal("client-b", body.RootElement.GetProperty("to_partition").GetString());
+    }
+
+    [Fact]
+    public async Task Move_WrongAssertion_SurfacesGenuineMiss404()
+    {
+        // Wrong expect / missing / tombstoned all collapse into the identical
+        // document_not_found 404.
+        var handler = MockHttpMessageHandler.WithJson(
+            new { error = "document not found: abc-123", code = "document_not_found" },
+            HttpStatusCode.NotFound);
+        using var client = CreateClient(handler);
+
+        var ex = await Assert.ThrowsAsync<AetherApiException>(
+            () => client.MoveDocumentAsync("abc-123", "client-b", "client-c"));
+
+        Assert.Equal(HttpStatusCode.NotFound, ex.StatusCode);
+        Assert.Equal("document_not_found", ex.ErrorCode);
+        Assert.False(ex.IsRetryable);
+    }
+
+    [Fact]
+    public async Task Move_RejectsEmptyDocId_NoHttpCall()
+    {
+        var calls = 0;
+        var handler = new MockHttpMessageHandler(_ =>
+        {
+            calls++;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+            };
+        });
+        using var client = CreateClient(handler);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.MoveDocumentAsync("", "client-a", "client-b"));
+        Assert.Equal(0, calls);
+    }
+
+    [Fact]
+    public async Task Move_RejectsInvalidNamedPartitions_ButNotNull_NoHttpCall()
+    {
+        // Non-null names follow the handle's validation rule; null is exempt —
+        // it is the meaningful "default partition" value, never rejected client-side.
+        var calls = 0;
+        var handler = new MockHttpMessageHandler(_ =>
+        {
+            calls++;
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent("{}", Encoding.UTF8, "application/json"),
+            };
+        });
+        using var client = CreateClient(handler);
+
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.MoveDocumentAsync("abc-123", "   ", "client-b"));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.MoveDocumentAsync("abc-123", "client-a", new string('a', 257)));
+        Assert.Equal(0, calls);
+    }
+
+    // ── Partition echo on responses ──────────────────────────────────
+
+    [Fact]
+    public async Task PartitionEcho_ParsedFromDocumentRecord()
+    {
+        using (var client = CreateClient(DocRecordHandler("client-a")))
+        {
+            var record = await client.GetAsync("abc-123");
+            Assert.Equal("client-a", record.Partition);
+        }
+
+        // Explicit null = the default partition.
+        using (var client = CreateClient(DocRecordHandler()))
+        {
+            var record = await client.GetAsync("abc-123");
+            Assert.Null(record.Partition);
+        }
+    }
+
+    [Fact]
+    public async Task PartitionEcho_ParsedFromListItems()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            documents = new object[]
+            {
+                new { doc_id = "d1", cid = "c1", content_type = "text/plain", size_bytes = 1, chunks = 1, vectors = 1, version = 1, partition = "client-a" },
+                new { doc_id = "d2", cid = "c2", content_type = "text/plain", size_bytes = 1, chunks = 1, vectors = 1, version = 1, partition = (string?)null },
+            },
+            count = 2,
+            total = 2,
+            has_more = false,
+        });
+        using var client = CreateClient(handler);
+
+        var listing = await client.ListAsync();
+
+        Assert.Equal("client-a", listing.Documents[0].Partition);
+        Assert.Null(listing.Documents[1].Partition);
+    }
+
+    [Fact]
+    public async Task PartitionEcho_ParsedFromSearchHits()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            query = "q",
+            results = new object[]
+            {
+                new { doc_id = "d1", score = 90, content_type = "text/plain", partition = "client-a" },
+                new { doc_id = "d2", score = 80, content_type = "text/plain", partition = (string?)null },
+            },
+        });
+        using var client = CreateClient(handler);
+
+        var hits = await client.SearchAsync("q");
+
+        Assert.Equal("client-a", hits[0].Partition);
+        Assert.Null(hits[1].Partition);
+    }
+
+    [Fact]
+    public async Task PartitionEcho_CarriedThroughRetrieve()
+    {
+        // Retrieve projects search hits into RetrievalResult; the echo must
+        // survive the projection (content inlined so no download round-trip).
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            query = "q",
+            results = new object[]
+            {
+                new { doc_id = "d1", score = 90, content_type = "text/plain", content = "full text", partition = "client-a" },
+            },
+        });
+        using var client = CreateClient(handler);
+
+        var results = await client.RetrieveAsync("q");
+
+        var hit = Assert.Single(results);
+        Assert.Equal("client-a", hit.Partition);
+    }
+
     // ── typed partition_required exception ───────────────────────────
+
+    [Fact]
+    public async Task UnguardedByIdCallUnderStrictKey_ThrowsPartitionRequired()
+    {
+        // A key minted with strict scoping 400s any unguarded by-ID call; the
+        // SDK surfaces the same typed exception as the unscoped read/write case.
+        var handler = MockHttpMessageHandler.WithJson(
+            new
+            {
+                error = "This API key requires every document call to name a partition.",
+                code = "partition_required",
+            },
+            HttpStatusCode.BadRequest);
+
+        using var client = CreateClient(handler);
+        var ex = await Assert.ThrowsAsync<PartitionRequiredException>(
+            () => client.GetAsync("abc-123"));
+
+        Assert.Equal("partition_required", ex.ErrorCode);
+        Assert.False(ex.IsRetryable);
+    }
 
     [Fact]
     public async Task UnscopedMultiTenantCall_ThrowsPartitionRequired()

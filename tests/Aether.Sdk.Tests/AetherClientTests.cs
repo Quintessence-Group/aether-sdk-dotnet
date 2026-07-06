@@ -738,6 +738,97 @@ public class AetherClientTests
         Assert.Equal("notion", doc.Source);
     }
 
+    // ── Provenance / lineage ──────────────────────────────────────
+
+    [Fact]
+    public async Task GetLineage_ReturnsSignedAuditRecords()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            doc_id = "abc-123",
+            records = new object[]
+            {
+                // Insert: carries a content_id in its proof.
+                new
+                {
+                    at = "2026-07-05T12:00:00+00:00",
+                    actor = "node:aabbcc",
+                    action = "document.inserted",
+                    resource = "document:abc-123",
+                    outcome = "committed",
+                    source = "ledger",
+                    proof = new
+                    {
+                        content_id = "blake3:deadbeef",
+                        lamport = 42,
+                        node_id = "aa",
+                        public_key = "bb",
+                        signature = "cc",
+                        verified = true,
+                    },
+                },
+                // Tombstone: the content_id KEY is omitted entirely (no content).
+                new
+                {
+                    at = "2026-07-05T13:00:00+00:00",
+                    actor = "node:aabbcc",
+                    action = "document.tombstoned",
+                    resource = "document:abc-123",
+                    outcome = "committed",
+                    source = "ledger",
+                    proof = new
+                    {
+                        lamport = 43,
+                        node_id = "aa",
+                        public_key = "bb",
+                        signature = "dd",
+                        verified = true,
+                    },
+                },
+            },
+        });
+
+        using var client = CreateClient(handler);
+        var records = await client.GetLineageAsync("abc-123");
+
+        Assert.Contains("/v1/audit/records/abc-123", handler.LastRequest!.RequestUri!.AbsolutePath);
+        Assert.Equal(2, records.Count);
+
+        // Insert record: fields deserialize and content_id is present.
+        var insert = records[0];
+        Assert.Equal("document.inserted", insert.Action);
+        Assert.Equal("committed", insert.Outcome);
+        Assert.Equal("ledger", insert.Source);
+        Assert.Equal("blake3:deadbeef", insert.Proof.ContentId);
+        Assert.Equal(42UL, insert.Proof.Lamport);
+        Assert.True(insert.Proof.Verified);
+
+        // Tombstone record: content_id key absent → nullable ContentId is null.
+        var tombstone = records[1];
+        Assert.Equal("document.tombstoned", tombstone.Action);
+        Assert.Equal(43UL, tombstone.Proof.Lamport);
+        Assert.Null(tombstone.Proof.ContentId);
+    }
+
+    [Fact]
+    public async Task GetLineage_ThrowsOnEmptyDocId()
+    {
+        using var client = CreateClient(MockHttpMessageHandler.WithJson(new { }));
+        await Assert.ThrowsAsync<ArgumentException>(() => client.GetLineageAsync(""));
+    }
+
+    [Fact]
+    public async Task GetLineage_ThrowsApiExceptionOnMissingDoc()
+    {
+        var handler = MockHttpMessageHandler.WithJson(
+            new { error = "Document not found" }, HttpStatusCode.NotFound);
+
+        using var client = CreateClient(handler);
+        var ex = await Assert.ThrowsAsync<AetherApiException>(
+            () => client.GetLineageAsync("nonexistent"));
+        Assert.Equal(HttpStatusCode.NotFound, ex.StatusCode);
+    }
+
     // ── Download ──────────────────────────────────────────────────
 
     [Fact]
@@ -2376,8 +2467,11 @@ public class AetherClientTests
     }
 
     [Fact]
-    public async Task Partition_DocIdMethods_SendNoPartition_Get()
+    public async Task Partition_DocIdMethods_SendPartitionGuard_Get()
     {
+        // A handle guards doc_id-addressed routes too, so a scoped client can
+        // never reach another partition's document via a bare doc id. (Full
+        // by-ID guard coverage lives in PartitionLifecycleTests.)
         var handler = MockHttpMessageHandler.WithJson(new
         {
             doc_id = "abc-123",
@@ -2392,18 +2486,18 @@ public class AetherClientTests
 
         await client.Partition("tenant-x").GetAsync("abc-123");
 
-        Assert.DoesNotContain("partition", handler.LastRequest!.RequestUri!.Query);
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
     }
 
     [Fact]
-    public async Task Partition_DocIdMethods_SendNoPartition_Delete()
+    public async Task Partition_DocIdMethods_SendPartitionGuard_Delete()
     {
         var handler = MockHttpMessageHandler.WithJson(new { status = "tombstoned", doc_id = "abc-123" });
         using var client = CreateClient(handler);
 
         await client.Partition("tenant-x").DeleteAsync("abc-123");
 
-        Assert.DoesNotContain("partition", handler.LastRequest!.RequestUri!.Query);
+        Assert.Contains("partition=tenant-x", handler.LastRequest!.RequestUri!.Query);
     }
 
     [Fact]
