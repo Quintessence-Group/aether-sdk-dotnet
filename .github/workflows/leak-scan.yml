@@ -1,5 +1,11 @@
 name: leak-scan
 on: [push, pull_request]
+
+# Least-privilege default: this workflow only reads the repo (checkout + git
+# grep/log). No write scopes are needed.
+permissions:
+  contents: read
+
 jobs:
   scan:
     runs-on: ubuntu-latest
