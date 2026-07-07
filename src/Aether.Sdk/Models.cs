@@ -39,6 +39,11 @@ public class DocumentRecord
     [JsonPropertyName("source")]
     public string? Source { get; set; }
 
+    /// <summary>The partition the document lives in, or null for the default
+    /// partition (mirrors the <see cref="EntityId"/>/<see cref="Source"/> convention).</summary>
+    [JsonPropertyName("partition")]
+    public string? Partition { get; set; }
+
     /// <summary>Structured metadata attached to the document.</summary>
     [JsonPropertyName("metadata")]
     public Dictionary<string, object?> Metadata { get; set; } = new();
@@ -93,6 +98,11 @@ public class SearchResult
     /// <summary>The matched document's source label, or null when it has none.</summary>
     [JsonPropertyName("source")]
     public string? Source { get; set; }
+
+    /// <summary>The partition the matched document lives in, or null for the default
+    /// partition (mirrors <see cref="DocumentRecord.Partition"/>).</summary>
+    [JsonPropertyName("partition")]
+    public string? Partition { get; set; }
 
     /// <summary>Structured metadata attached to the matched document.</summary>
     [JsonPropertyName("metadata")]
@@ -197,6 +207,11 @@ public class RetrievalResult
     /// <summary>The matched document's source label, or null when it has none.</summary>
     [JsonPropertyName("source")]
     public string? Source { get; set; }
+
+    /// <summary>The partition the matched document lives in, or null for the default
+    /// partition (mirrors <see cref="SearchResult.Partition"/>).</summary>
+    [JsonPropertyName("partition")]
+    public string? Partition { get; set; }
 
     /// <summary>Structured metadata attached to the matched document.</summary>
     [JsonPropertyName("metadata")]
@@ -821,6 +836,18 @@ internal class EntityBackfillRequest
     public bool Overwrite { get; set; }
 }
 
+// Wire body of POST /documents/{id}/move. Both fields are always present on
+// the wire — an explicit JSON null names the default partition — so neither
+// carries WhenWritingNull, unlike every other optional wire field.
+internal class MoveDocumentRequest
+{
+    [JsonPropertyName("to_partition")]
+    public string? ToPartition { get; set; }
+
+    [JsonPropertyName("expect_partition")]
+    public string? ExpectPartition { get; set; }
+}
+
 // Wire shape of one query's results in a batch search: the public
 // BatchSearchResponse envelope plus the optional per-query usage-feedback
 // query_id, which the SDK stamps onto each hit.
@@ -1075,4 +1102,92 @@ internal class MemoryFactListResponse
 
     [JsonPropertyName("count")]
     public int Count { get; set; }
+}
+
+// ── Provenance / lineage ─────────────────────────────────────────────────
+//
+// Read models mirroring the engine's signed-provenance DTOs 1:1 for
+// GetLineageAsync (GET /v1/audit/records/{doc_id}). Field names are wire
+// snake_case via [JsonPropertyName] (the shared JsonSerializerOptions has no
+// naming policy, so every property needs an explicit mapping — same pattern as
+// DocumentRecord). Timestamps are RFC 3339 strings, left unparsed.
+
+/// <summary>The cryptographic proof attached to an <see cref="AuditRecord"/>: the
+/// node signature over the event, plus the Lamport clock and content id that
+/// anchor it in the ledger. Present on every ledger-sourced record.</summary>
+public class AuditProof
+{
+    /// <summary>Content address of the document at the time of the event
+    /// (<c>blake3:…</c>), or null when the event carries no content (e.g. a
+    /// tombstone).</summary>
+    [JsonPropertyName("content_id")]
+    public string? ContentId { get; set; }
+
+    /// <summary>The event's Lamport logical-clock timestamp.</summary>
+    [JsonPropertyName("lamport")]
+    public ulong Lamport { get; set; }
+
+    /// <summary>The signing node's id (64-hex).</summary>
+    [JsonPropertyName("node_id")]
+    public string NodeId { get; set; } = "";
+
+    /// <summary>The signing node's public key (hex).</summary>
+    [JsonPropertyName("public_key")]
+    public string PublicKey { get; set; } = "";
+
+    /// <summary>The detached signature over the event (hex).</summary>
+    [JsonPropertyName("signature")]
+    public string Signature { get; set; } = "";
+
+    /// <summary>Whether the engine verified <see cref="Signature"/> against
+    /// <see cref="PublicKey"/> when it assembled this record.</summary>
+    [JsonPropertyName("verified")]
+    public bool Verified { get; set; }
+}
+
+/// <summary>A single signed entry in a document's provenance ledger, returned by
+/// <see cref="AetherClient.GetLineageAsync"/>. Each record captures who did what
+/// to the document, when, and the outcome — anchored by a cryptographic
+/// <see cref="Proof"/>.</summary>
+public class AuditRecord
+{
+    /// <summary>RFC 3339 timestamp of the event, unparsed.</summary>
+    [JsonPropertyName("at")]
+    public string At { get; set; } = "";
+
+    /// <summary>The actor that performed the action (e.g. <c>node:&lt;hex&gt;</c>).</summary>
+    [JsonPropertyName("actor")]
+    public string Actor { get; set; } = "";
+
+    /// <summary>The action performed (e.g. <c>document.inserted</c>).</summary>
+    [JsonPropertyName("action")]
+    public string Action { get; set; } = "";
+
+    /// <summary>The resource the action targeted (e.g. <c>document:&lt;uuid&gt;</c>).</summary>
+    [JsonPropertyName("resource")]
+    public string Resource { get; set; } = "";
+
+    /// <summary>The outcome of the action (e.g. <c>committed</c>).</summary>
+    [JsonPropertyName("outcome")]
+    public string Outcome { get; set; } = "";
+
+    /// <summary>Where the record was sourced from (e.g. <c>ledger</c>).</summary>
+    [JsonPropertyName("source")]
+    public string Source { get; set; } = "";
+
+    /// <summary>The cryptographic proof anchoring this record in the ledger.</summary>
+    [JsonPropertyName("proof")]
+    public AuditProof Proof { get; set; } = new();
+}
+
+// Internal list-envelope wrapper for GET /audit/records/{doc_id} (the `doc_id`
+// echo is dropped — callers get the records list, mirroring how the document
+// list drops its envelope around DocumentRecord).
+internal class LineageResponse
+{
+    [JsonPropertyName("doc_id")]
+    public string DocId { get; set; } = "";
+
+    [JsonPropertyName("records")]
+    public List<AuditRecord> Records { get; set; } = new();
 }

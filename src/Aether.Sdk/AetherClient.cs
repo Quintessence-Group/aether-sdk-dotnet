@@ -10,7 +10,7 @@ namespace Aether.Sdk;
 /// <summary>
 /// Client for the Aether dRAG HTTP API.
 /// </summary>
-public class AetherClient : IDisposable
+public partial class AetherClient : IDisposable
 {
     private readonly HttpClient _http;
     private readonly bool _ownsHttpClient;
@@ -274,6 +274,13 @@ public class AetherClient : IDisposable
     /// <c>client.Partition("a").Partition("b")</c> is scoped to "b". Under a single-tenant
     /// key the top-level (unscoped) client sends no partition and operates on the default
     /// partition, so hello-world stays frictionless.
+    /// <para>
+    /// On <c>doc_id</c>-addressed routes (<see cref="GetAsync"/>, <see cref="DownloadAsync"/>,
+    /// <see cref="DeleteAsync"/> / <see cref="HardDeleteAsync"/>, <see cref="RestoreAsync"/>,
+    /// <see cref="UpdateAsync"/>) the handle sends the partition as a <b>guard</b>: a
+    /// document in another partition surfaces the identical not-found 404 a nonexistent id
+    /// would, so a scoped client can never reach across the boundary via a bare doc id.
+    /// </para>
     /// </remarks>
     /// <param name="partitionId">The partition to scope to. Non-empty, non-whitespace, 1–256 characters.</param>
     /// <exception cref="ArgumentException">The partition ID is empty/whitespace or longer than 256 characters.</exception>
@@ -283,14 +290,14 @@ public class AetherClient : IDisposable
         return new AetherClient(this, partitionId);
     }
 
-    private static void ValidatePartitionId(string partitionId)
+    private static void ValidatePartitionId(string partitionId, string paramName = "partitionId")
     {
         if (string.IsNullOrWhiteSpace(partitionId))
             throw new ArgumentException(
-                "partitionId cannot be empty and must contain a non-whitespace character", nameof(partitionId));
+                $"{paramName} cannot be empty and must contain a non-whitespace character", paramName);
         if (partitionId.Length > 256)
             throw new ArgumentException(
-                "partitionId cannot be longer than 256 characters", nameof(partitionId));
+                $"{paramName} cannot be longer than 256 characters", paramName);
     }
 
     // Appends &partition=<id> to a query string when this client is partition-scoped,
@@ -300,6 +307,19 @@ public class AetherClient : IDisposable
         if (!string.IsNullOrEmpty(_partition))
             query += $"&partition={Uri.EscapeDataString(_partition!)}";
         return query;
+    }
+
+    // Appends the partition guard to a doc_id-addressed path when this client is
+    // partition-scoped, starting the query string when the path has none. The
+    // server treats a mismatched guard as the identical not-found 404, so a
+    // scoped handle can never reach another partition's document via a bare
+    // doc id. No-op on the unscoped client (the pre-hardening behavior).
+    private string AppendPartitionGuard(string path)
+    {
+        if (string.IsNullOrEmpty(_partition))
+            return path;
+        var separator = path.IndexOf('?') < 0 ? '?' : '&';
+        return $"{path}{separator}partition={Uri.EscapeDataString(_partition!)}";
     }
 
     // ── Memory graph transport hook ───────────────────────────────────
@@ -815,7 +835,31 @@ public class AetherClient : IDisposable
         if (string.IsNullOrEmpty(docId))
             throw new ArgumentException("docId cannot be empty", nameof(docId));
         return await RequestAsync<DocumentRecord>(
-            $"/documents/{Uri.EscapeDataString(docId)}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+            AppendPartitionGuard($"/documents/{Uri.EscapeDataString(docId)}"),
+            HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Fetch the signed provenance ledger for a document: the ordered list of
+    /// <see cref="AuditRecord"/>s (insert, update, tombstone, …) that touched it,
+    /// each anchored by a cryptographic <see cref="AuditProof"/>. The lineage is
+    /// tenant-scoped by the API key.
+    /// </summary>
+    /// <param name="docId">The document id whose lineage to fetch.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The document's audit records, oldest first; possibly empty.</returns>
+    /// <exception cref="ArgumentException"><paramref name="docId"/> is empty.</exception>
+    /// <exception cref="AetherApiException">The document does not exist (404), or another API error.</exception>
+    public async Task<IReadOnlyList<AuditRecord>> GetLineageAsync(
+        string docId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(docId))
+            throw new ArgumentException("docId cannot be empty", nameof(docId));
+        var response = await RequestAsync<LineageResponse>(
+            $"/audit/records/{Uri.EscapeDataString(docId)}",
+            HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+        return response.Records;
     }
 
     /// <summary>Download a document as raw bytes.</summary>
@@ -826,7 +870,8 @@ public class AetherClient : IDisposable
         if (string.IsNullOrEmpty(docId))
             throw new ArgumentException("docId cannot be empty", nameof(docId));
         return await RequestRawAsync(
-            $"/documents/{Uri.EscapeDataString(docId)}/download", cancellationToken).ConfigureAwait(false);
+            AppendPartitionGuard($"/documents/{Uri.EscapeDataString(docId)}/download"),
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>List active documents with pagination.</summary>
@@ -878,7 +923,8 @@ public class AetherClient : IDisposable
         if (string.IsNullOrEmpty(docId))
             throw new ArgumentException("docId cannot be empty", nameof(docId));
         await RequestVoidAsync(
-            $"/documents/{Uri.EscapeDataString(docId)}", HttpMethod.Delete, cancellationToken).ConfigureAwait(false);
+            AppendPartitionGuard($"/documents/{Uri.EscapeDataString(docId)}"),
+            HttpMethod.Delete, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -895,7 +941,8 @@ public class AetherClient : IDisposable
         if (string.IsNullOrEmpty(docId))
             throw new ArgumentException("docId cannot be empty", nameof(docId));
         await RequestVoidAsync(
-            $"/documents/{Uri.EscapeDataString(docId)}?hard=true", HttpMethod.Delete, cancellationToken).ConfigureAwait(false);
+            AppendPartitionGuard($"/documents/{Uri.EscapeDataString(docId)}?hard=true"),
+            HttpMethod.Delete, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Restore a tombstoned document.</summary>
@@ -906,7 +953,56 @@ public class AetherClient : IDisposable
         if (string.IsNullOrEmpty(docId))
             throw new ArgumentException("docId cannot be empty", nameof(docId));
         await RequestVoidAsync(
-            $"/documents/{Uri.EscapeDataString(docId)}/restore", HttpMethod.Post, cancellationToken).ConfigureAwait(false);
+            AppendPartitionGuard($"/documents/{Uri.EscapeDataString(docId)}/restore"),
+            HttpMethod.Post, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Move a document between partitions. Metadata-only: content, <c>cid</c>,
+    /// chunks, and vectors are unchanged (no re-embed); <see cref="DocumentRecord.Version"/>
+    /// increments on a real move.</summary>
+    /// <remarks>
+    /// The only way to move a document between named partitions.
+    /// <paramref name="fromPartition"/> asserts where the document lives <b>now</b>;
+    /// <paramref name="toPartition"/> is the destination. <c>null</c> is a valid,
+    /// meaningful value for both — the <b>default</b> partition — so both fields are
+    /// always sent on the wire (an explicit JSON <c>null</c>, never omitted). A wrong
+    /// <paramref name="fromPartition"/> assertion, a missing id, or a tombstoned
+    /// document all surface the identical not-found 404 (the guard is never a
+    /// partition-existence oracle); <paramref name="toPartition"/> equal to
+    /// <paramref name="fromPartition"/> is an idempotent 200 no-op. Deliberately
+    /// <b>not</b> auto-scoped by a partition handle — like
+    /// <see cref="DeletePartitionAsync"/>, a relocating call names its partitions
+    /// explicitly rather than inheriting an implicit scope.
+    /// </remarks>
+    /// <param name="docId">The document to move.</param>
+    /// <param name="fromPartition">The partition the document lives in now; null for the default partition.</param>
+    /// <param name="toPartition">The destination partition; null for the default partition.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <returns>The updated document record, echoing the new partition.</returns>
+    /// <exception cref="ArgumentException">The doc ID is empty, or a non-null partition is empty/whitespace or longer than 256 characters.</exception>
+    public async Task<DocumentRecord> MoveDocumentAsync(
+        string docId,
+        string? fromPartition,
+        string? toPartition,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(docId))
+            throw new ArgumentException("docId cannot be empty", nameof(docId));
+        // Null names the default partition and passes through untouched; only a
+        // non-null id is held to the handle's validation rule.
+        if (fromPartition != null)
+            ValidatePartitionId(fromPartition, nameof(fromPartition));
+        if (toPartition != null)
+            ValidatePartitionId(toPartition, nameof(toPartition));
+        var body = new MoveDocumentRequest
+        {
+            ToPartition = toPartition,
+            ExpectPartition = fromPartition,
+        };
+        var json = JsonSerializer.Serialize(body, JsonOptions);
+        var content = new StringContent(json, Encoding.UTF8, "application/json");
+        return await RequestAsync<DocumentRecord>(
+            $"/documents/{Uri.EscapeDataString(docId)}/move", HttpMethod.Post, content, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Backfill <c>entity_id</c> on the tenant's existing documents from a tag convention.
@@ -915,6 +1011,8 @@ public class AetherClient : IDisposable
     /// ambiguous (two or more) or absent matches are skipped. Documents that already have an entity ID are
     /// left alone unless <paramref name="overwrite"/> is true. This is a metadata-only operation — documents
     /// are not re-embedded.</summary>
+    /// <remarks>A partition handle constrains the scan to its partition (a multi-tenant
+    /// key requires one — the unscoped call fails with <see cref="PartitionRequiredException"/>).</remarks>
     /// <param name="tagPrefix">Tag prefix to match (required, non-empty); the suffix after it becomes the entity ID.</param>
     /// <param name="overwrite">When true, also overwrite documents that already have an entity ID. Default: false.</param>
     /// <param name="ct">Cancellation token.</param>
@@ -930,7 +1028,8 @@ public class AetherClient : IDisposable
         var json = JsonSerializer.Serialize(body, JsonOptions);
         var content = new StringContent(json, Encoding.UTF8, "application/json");
         return await RequestAsync<EntityBackfillReport>(
-            "/documents/backfill-entity", HttpMethod.Post, content, ct).ConfigureAwait(false);
+            AppendPartitionGuard("/documents/backfill-entity"),
+            HttpMethod.Post, content, ct).ConfigureAwait(false);
     }
 
     // ── Ingestion ─────────────────────────────────────────────────────
@@ -1283,6 +1382,7 @@ public class AetherClient : IDisposable
                 EntityId = r.EntityId,
                 Tags = r.Tags,
                 Source = r.Source,
+                Partition = r.Partition,
                 Metadata = r.Metadata,
                 CreatedAt = r.CreatedAt,
                 UpdatedAt = r.UpdatedAt,
