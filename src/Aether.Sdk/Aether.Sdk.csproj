@@ -27,6 +27,7 @@
 
   <ItemGroup>
     <InternalsVisibleTo Include="Aether.Sdk.Tests" />
+    <InternalsVisibleTo Include="Aether.Sdk.SemanticKernel.Tests" />
   </ItemGroup>
 
   <ItemGroup Condition="'$(TargetFramework)' == 'netstandard2.0'">
