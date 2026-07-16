@@ -1,0 +1,31 @@
+name: CI
+
+# Pull-request + push gate for the .NET SDK: restore, format check, build, and
+# test the whole solution (core SDK, Semantic Kernel provider, and their tests).
+# Publishing lives in release.yml (tag-triggered, OIDC).
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  dotnet-sdk:
+    name: .NET SDK
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "8.0.x"
+      - name: Restore
+        run: dotnet restore
+      - name: Format check
+        run: dotnet format --verify-no-changes --no-restore
+      - name: Build
+        run: dotnet build --configuration Release --no-restore
+      - name: Test
+        run: dotnet test --configuration Release --no-build
