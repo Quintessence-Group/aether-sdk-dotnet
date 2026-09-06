@@ -12,6 +12,7 @@ namespace Aether.Sdk;
 /// </summary>
 public partial class AetherClient : IDisposable
 {
+    private const int MaxThreadReadTurns = 1000;
     private readonly HttpClient _http;
     private readonly bool _ownsHttpClient;
     private readonly string _baseUrl;
@@ -26,7 +27,7 @@ public partial class AetherClient : IDisposable
     private bool _disposed;
 
     /// <summary>SDK version, reported in the User-Agent header. Keep in sync with the csproj &lt;Version&gt;.</summary>
-    private const string Version = "0.3.2";
+    private const string Version = "0.6.0";
 
     private static readonly HashSet<HttpStatusCode> RetryableStatusCodes = new()
     {
@@ -155,6 +156,14 @@ public partial class AetherClient : IDisposable
         if (filter is { Count: > 0 })
             qs += $"&filter={Uri.EscapeDataString(JsonSerializer.Serialize(filter, JsonOptions))}";
         return qs;
+    }
+
+    private static string AppendThreadSearchFilter(string baseQuery, string? threadId)
+    {
+        if (string.IsNullOrEmpty(threadId))
+            return baseQuery;
+        ValidateThreadId(threadId!, nameof(threadId));
+        return baseQuery + $"&thread_id={Uri.EscapeDataString(threadId!)}";
     }
 
     // Appends the OR-list metadata filters (anyTags / contentTypes / sources) as
@@ -300,6 +309,47 @@ public partial class AetherClient : IDisposable
                 $"{paramName} cannot be longer than 256 characters", paramName);
     }
 
+    internal static void ValidateThreadId(string threadId, string paramName = "threadId")
+    {
+        if (string.IsNullOrWhiteSpace(threadId))
+            throw new ArgumentException("threadId cannot be empty", paramName);
+        if (threadId is "." or "..")
+            throw new ArgumentException("threadId cannot be a reserved URL dot segment", paramName);
+        if (threadId.Any(char.IsControl))
+            throw new ArgumentException("threadId cannot contain control characters", paramName);
+        if (!TryUnicodeScalarCount(threadId, out var scalarCount))
+            throw new ArgumentException("threadId must contain only valid Unicode scalar values", paramName);
+        if (scalarCount > 256)
+            throw new ArgumentException("threadId cannot be longer than 256 characters", paramName);
+    }
+
+    // netstandard2.0 predates System.Text.Rune. Count surrogate pairs as one
+    // Unicode scalar and reject unpaired surrogates so malformed UTF-16 cannot
+    // become a different identity at an HTTP/UTF-8 boundary.
+    private static bool TryUnicodeScalarCount(string value, out int count)
+    {
+        count = 0;
+        for (var index = 0; index < value.Length; index++)
+        {
+            if (char.IsHighSurrogate(value[index]))
+            {
+                if (index + 1 >= value.Length || !char.IsLowSurrogate(value[index + 1]))
+                    return false;
+                index++;
+            }
+            else if (char.IsLowSurrogate(value[index]))
+            {
+                return false;
+            }
+            count++;
+        }
+        return true;
+    }
+
+    // The partition this client is bound to (null on the unscoped client). Used by
+    // the Memory.Thread facade to assert a thread's current home on a move.
+    internal string? ScopedPartition => _partition;
+
     // Appends &partition=<id> to a query string when this client is partition-scoped,
     // URL-encoding exactly like entity_id. No-op on the unscoped client.
     private string AppendPartition(string query)
@@ -385,10 +435,11 @@ public partial class AetherClient : IDisposable
             if (!RetryableStatusCodes.Contains(response.StatusCode))
                 return response;
 
-            // Parse Retry-After header for 429 responses
+            // Honor Retry-After on every retryable response. Thread context
+            // downloads use 503 while an origin is still projecting a
+            // committed canonical turn, and must wait rather than false-404.
             TimeSpan? retryAfter = null;
-            if (response.StatusCode == (HttpStatusCode)429 &&
-                response.Headers.RetryAfter is { } ra)
+            if (response.Headers.RetryAfter is { } ra)
             {
                 if (ra.Delta.HasValue)
                     retryAfter = ra.Delta.Value;
@@ -401,22 +452,28 @@ public partial class AetherClient : IDisposable
         }
     }
 
+    private async Task<HttpResponseMessage> SendMaybeRetryAsync(
+        Func<HttpRequestMessage> requestFactory,
+        CancellationToken cancellationToken,
+        bool retry)
+    {
+        if (retry)
+            return await SendWithRetryAsync(requestFactory, cancellationToken).ConfigureAwait(false);
+
+        using var request = requestFactory();
+        return await _http.SendAsync(request, cancellationToken).ConfigureAwait(false);
+    }
+
     private async Task DelayBeforeRetryAsync(
         int attempt,
         TimeSpan? retryAfter,
         CancellationToken cancellationToken)
     {
-        TimeSpan delay;
-
-        if (retryAfter.HasValue && retryAfter.Value > TimeSpan.Zero)
-        {
+        // Exponential backoff: baseDelay * 2^attempt. Retry-After is a floor,
+        // never permission to retry sooner than the configured backoff.
+        var delay = TimeSpan.FromTicks((long)(_retryBaseDelay.Ticks * Math.Pow(2, attempt)));
+        if (retryAfter.HasValue && retryAfter.Value > delay)
             delay = retryAfter.Value;
-        }
-        else
-        {
-            // Exponential backoff: baseDelay * 2^attempt
-            delay = TimeSpan.FromTicks((long)(_retryBaseDelay.Ticks * Math.Pow(2, attempt)));
-        }
 
         // Add jitter: random 0-50% of delay
 #if NET8_0_OR_GREATER
@@ -452,7 +509,9 @@ public partial class AetherClient : IDisposable
         string path,
         HttpMethod method,
         HttpContent? content = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? idempotencyKey = null,
+        bool retry = true)
     {
         // Data routes are rewritten under the /v1 API version prefix here, at the
         // transport boundary, so every caller (including the Memory facade)
@@ -477,12 +536,18 @@ public partial class AetherClient : IDisposable
 
         // Mint one idempotency key per logical write, reused across retries so
         // the server can deduplicate a request whose response was lost in transit.
-        string? idempotencyKey = method == HttpMethod.Post ? Guid.NewGuid().ToString() : null;
+        // An explicitly supplied key is honored on ANY method (the thread
+        // ACL/delete routes require the header on PUT/DELETE and mint one before
+        // calling here); a POST with no supplied key still mints one, and other
+        // methods with no supplied key stay header-free exactly as before.
+        idempotencyKey = !string.IsNullOrEmpty(idempotencyKey)
+            ? idempotencyKey
+            : (method == HttpMethod.Post ? Guid.NewGuid().ToString() : null);
 
         HttpResponseMessage response;
         try
         {
-            response = await SendWithRetryAsync(() =>
+            response = await SendMaybeRetryAsync(() =>
             {
                 var msg = new HttpRequestMessage(method, url);
                 if (contentBytes != null)
@@ -497,7 +562,7 @@ public partial class AetherClient : IDisposable
                 if (idempotencyKey != null)
                     msg.Headers.Add("Idempotency-Key", idempotencyKey);
                 return msg;
-            }, cancellationToken).ConfigureAwait(false);
+            }, cancellationToken, retry).ConfigureAwait(false);
         }
         catch (TaskCanceledException ex) when (!cancellationToken.IsCancellationRequested)
         {
@@ -711,6 +776,59 @@ public partial class AetherClient : IDisposable
         return await InsertAsync(bytes, filename, "text/plain", tags, chunking, entityId, source, metadata, extractFacts, cancellationToken).ConfigureAwait(false);
     }
 
+    /// <summary>
+    /// Store image/audio bytes as a multimodal memory. The original bytes are
+    /// encrypted by the normal document workflow; the server indexes the
+    /// supplied caption/transcript or invokes its configured processor.
+    /// </summary>
+    public Task<MediaMemoryRecord> RememberMediaAsync(
+        byte[] media,
+        string modality,
+        string contentType,
+        string entityId,
+        string? filename = null,
+        string? caption = null,
+        string? transcript = null,
+        IReadOnlyList<string>? tags = null,
+        IReadOnlyDictionary<string, object?>? metadata = null,
+        string? source = null,
+        IReadOnlyList<string>? readers = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (media == null || media.Length == 0)
+            throw new ArgumentException("media cannot be empty", nameof(media));
+        modality = modality?.Trim().ToLowerInvariant()
+            ?? throw new ArgumentNullException(nameof(modality));
+        if (modality != "image" && modality != "audio")
+            throw new ArgumentException("modality must be 'image' or 'audio'", nameof(modality));
+        if (string.IsNullOrWhiteSpace(contentType))
+            throw new ArgumentException("contentType cannot be empty", nameof(contentType));
+        if (string.IsNullOrWhiteSpace(entityId))
+            throw new ArgumentException("entityId cannot be empty", nameof(entityId));
+        if (modality == "image" && transcript != null)
+            throw new ArgumentException("transcript is valid only for audio memories", nameof(transcript));
+        if (modality == "audio" && caption != null)
+            throw new ArgumentException("caption is valid only for image memories", nameof(caption));
+
+        var query = $"entity_id={Uri.EscapeDataString(entityId)}";
+        if (readers != null)
+            query += $"&readers={Uri.EscapeDataString(string.Join(",", readers))}";
+        var body = new Dictionary<string, object?>
+        {
+            ["modality"] = modality,
+            ["data_base64"] = Convert.ToBase64String(media),
+            ["content_type"] = contentType,
+        };
+        if (!string.IsNullOrWhiteSpace(filename)) body["filename"] = filename;
+        if (caption != null) body["caption"] = caption;
+        if (transcript != null) body["transcript"] = transcript;
+        if (tags != null) body["tags"] = tags;
+        if (metadata != null) body["metadata"] = metadata;
+        if (!string.IsNullOrWhiteSpace(source)) body["source"] = source;
+        return SendMemoryAsync<MediaMemoryRecord>(
+            HttpMethod.Post, "/memory/media", query, body, cancellationToken);
+    }
+
     /// <summary>Insert a document from a Stream without buffering the entire body in memory.
     /// Unlike <see cref="InsertAsync"/>, this method does not retry on transient errors
     /// because the stream may not be re-readable.</summary>
@@ -839,6 +957,208 @@ public partial class AetherClient : IDisposable
             HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
+    // ── Conversational threads ───────────────────────────────────────
+
+    /// <summary>
+    /// Append a retry-safe turn to a tenant-scoped conversation. The
+    /// server's shared control plane assigns <see cref="DocumentRecord.TurnIndex"/>
+    /// atomically; callers must not calculate it locally.
+    /// </summary>
+    public async Task<DocumentRecord> AppendThreadAsync(
+        string threadId,
+        ThreadAppendRequest request,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateThreadId(threadId);
+        if (request == null)
+            throw new ArgumentNullException(nameof(request));
+        if (string.IsNullOrWhiteSpace(request.Text))
+            throw new ArgumentException("thread text cannot be empty", nameof(request));
+        var json = JsonSerializer.Serialize(request, JsonOptions);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        var path = AppendPartitionGuard($"/threads/{Uri.EscapeDataString(threadId)}/append");
+        return await RequestAsync<DocumentRecord>(
+            path,
+            HttpMethod.Post,
+            content,
+            cancellationToken,
+            request.IdempotencyKey).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Read the canonical shared conversation. A partition-scoped client
+    /// injects its usual hard partition boundary automatically.
+    /// </summary>
+    public async Task<ConversationThread> GetThreadAsync(
+        string threadId,
+        ThreadReadOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateThreadId(threadId);
+        options ??= new ThreadReadOptions();
+        if (options.LastNTurns is < 1 or > MaxThreadReadTurns)
+            throw new ArgumentOutOfRangeException(
+                nameof(options),
+                $"LastNTurns must be between 1 and {MaxThreadReadTurns}");
+        var query = new List<string>();
+        if (options.LastNTurns.HasValue)
+            query.Add($"last_n_turns={options.LastNTurns.Value}");
+        if (options.RecentFirst)
+            query.Add("recent_first=true");
+        if (!string.IsNullOrEmpty(_partition))
+            query.Add($"partition={Uri.EscapeDataString(_partition!)}");
+        var path = $"/threads/{Uri.EscapeDataString(threadId)}";
+        if (query.Count > 0)
+            path += "?" + string.Join("&", query);
+        return await RequestAsync<ConversationThread>(
+            path, HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    // ── Whole-thread lifecycle ─────────────────────────────
+    //
+    // Owner/admin-scoped ops over the canonical shared thread. Each REQUIRES an
+    // Idempotency-Key header (like AppendThreadAsync): a stable key is minted here
+    // when the caller omits one and reused across retries. restore/acl/delete inject
+    // the client's hard partition boundary as the `partition` query guard exactly
+    // like GetThreadAsync/AppendThreadAsync; move is deliberately NOT auto-scoped —
+    // like MoveDocumentAsync it names its partitions explicitly in the body.
+
+    private static string MintIdempotencyKey(string? supplied) =>
+        string.IsNullOrEmpty(supplied) ? Guid.NewGuid().ToString() : supplied!;
+
+    /// <summary>
+    /// Restore (un-tombstone) a whole conversation thread. Owner/admin-scoped and
+    /// retry-safe via a required <c>Idempotency-Key</c> header. A partition-scoped
+    /// client injects its hard partition boundary automatically.
+    /// </summary>
+    /// <param name="threadId">The conversation thread to restore.</param>
+    /// <param name="idempotencyKey">Optional stable retry key; one is minted when omitted.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task<ThreadLifecycleResult> ThreadRestoreAsync(
+        string threadId,
+        string? idempotencyKey = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateThreadId(threadId);
+        var path = AppendPartitionGuard($"/threads/{Uri.EscapeDataString(threadId)}/restore");
+        return await RequestAsync<ThreadLifecycleResult>(
+            path,
+            HttpMethod.Post,
+            null,
+            cancellationToken,
+            MintIdempotencyKey(idempotencyKey)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Rewrite the intra-tenant read ACL on every turn of a thread. Mirrors the
+    /// insert/update <c>acl_readers</c> semantics: <paramref name="aclReaders"/> null
+    /// unlabels (tenant-visible), an empty list quarantines to admin-only, and a
+    /// non-empty list restricts to those readers. The field is always sent on the
+    /// wire (an explicit JSON null unlabels). Owner/admin-scoped; retry-safe via a
+    /// required <c>Idempotency-Key</c> header. A partition-scoped client injects its
+    /// hard partition boundary automatically.
+    /// </summary>
+    /// <param name="threadId">The conversation thread to relabel.</param>
+    /// <param name="aclReaders">Target read ACL: null unlabels, [] quarantines, [..] restricts.</param>
+    /// <param name="idempotencyKey">Optional stable retry key; one is minted when omitted.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task<ThreadLifecycleResult> ThreadAclAsync(
+        string threadId,
+        IReadOnlyList<string>? aclReaders,
+        string? idempotencyKey = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateThreadId(threadId);
+        var body = new ThreadAclRequest { AclReaders = aclReaders?.ToList() };
+        var json = JsonSerializer.Serialize(body, JsonOptions);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        var path = AppendPartitionGuard($"/threads/{Uri.EscapeDataString(threadId)}/acl");
+        return await RequestAsync<ThreadLifecycleResult>(
+            path,
+            HttpMethod.Put,
+            content,
+            cancellationToken,
+            MintIdempotencyKey(idempotencyKey)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Move a whole thread between partitions. Metadata-only, mirroring
+    /// <see cref="MoveDocumentAsync"/>: both fields are always sent (an explicit JSON
+    /// null names the default partition), <paramref name="expectPartition"/> asserts
+    /// where the thread lives <b>now</b> (a wrong assertion is the identical
+    /// not-found 404 — never a partition oracle), and <paramref name="toPartition"/>
+    /// is the destination. Owner/admin-scoped; retry-safe via a required
+    /// <c>Idempotency-Key</c> header. Deliberately <b>not</b> auto-scoped by a
+    /// partition handle — like <see cref="MoveDocumentAsync"/> it names its
+    /// partitions explicitly rather than inheriting an implicit scope.
+    /// </summary>
+    /// <param name="threadId">The conversation thread to move.</param>
+    /// <param name="expectPartition">The partition the thread lives in now; null for the default partition.</param>
+    /// <param name="toPartition">The destination partition; null for the default partition.</param>
+    /// <param name="idempotencyKey">Optional stable retry key; one is minted when omitted.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="ArgumentException">The thread id is invalid, or a non-null partition is empty/whitespace or longer than 256 characters.</exception>
+    public async Task<ThreadLifecycleResult> ThreadMoveAsync(
+        string threadId,
+        string? expectPartition,
+        string? toPartition,
+        string? idempotencyKey = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateThreadId(threadId);
+        // Null names the default partition and passes through untouched; only a
+        // non-null id is held to the handle's validation rule.
+        if (expectPartition != null)
+            ValidatePartitionId(expectPartition, nameof(expectPartition));
+        if (toPartition != null)
+            ValidatePartitionId(toPartition, nameof(toPartition));
+        var body = new MoveThreadRequest
+        {
+            ToPartition = toPartition,
+            ExpectPartition = expectPartition,
+        };
+        var json = JsonSerializer.Serialize(body, JsonOptions);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        var path = $"/threads/{Uri.EscapeDataString(threadId)}/move";
+        return await RequestAsync<ThreadLifecycleResult>(
+            path,
+            HttpMethod.Post,
+            content,
+            cancellationToken,
+            MintIdempotencyKey(idempotencyKey)).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Delete a whole thread. The default is a reversible soft tombstone (restore
+    /// with <see cref="ThreadRestoreAsync"/>); <paramref name="hard"/> selects the
+    /// terminal <c>?hard=true</c> cryptographic erasure, after which nothing is
+    /// recoverable. Owner/admin-scoped; retry-safe via a required
+    /// <c>Idempotency-Key</c> header. A partition-scoped client injects its hard
+    /// partition boundary automatically.
+    /// </summary>
+    /// <param name="threadId">The conversation thread to delete.</param>
+    /// <param name="hard">When true, irreversibly crypto-erase the thread; otherwise soft-tombstone.</param>
+    /// <param name="idempotencyKey">Optional stable retry key; one is minted when omitted.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task<ThreadLifecycleResult> ThreadDeleteAsync(
+        string threadId,
+        bool hard = false,
+        string? idempotencyKey = null,
+        CancellationToken cancellationToken = default)
+    {
+        ValidateThreadId(threadId);
+        var basePath = hard
+            ? $"/threads/{Uri.EscapeDataString(threadId)}?hard=true"
+            : $"/threads/{Uri.EscapeDataString(threadId)}";
+        var path = AppendPartitionGuard(basePath);
+        return await RequestAsync<ThreadLifecycleResult>(
+            path,
+            HttpMethod.Delete,
+            null,
+            cancellationToken,
+            MintIdempotencyKey(idempotencyKey)).ConfigureAwait(false);
+    }
+
     /// <summary>
     /// Fetch the signed provenance ledger for a document: the ordered list of
     /// <see cref="AuditRecord"/>s (insert, update, tombstone, …) that touched it,
@@ -860,6 +1180,63 @@ public partial class AetherClient : IDisposable
             $"/audit/records/{Uri.EscapeDataString(docId)}",
             HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
         return response.Records;
+    }
+
+    /// <summary>
+    /// Bind an answer to the ordered document ids the application declared as
+    /// grounding sources. The returned trust status verifies retained signed
+    /// source evidence only; it does not assess factual correctness or prove an
+    /// external model's reasoning. Set <paramref name="share"/> to create a
+    /// revocable, aggregate-only public receipt and SVG badge. Share issuance
+    /// is sent once rather than retried automatically: a response-lost retry
+    /// could mint a second bearer capability.
+    /// </summary>
+    /// <param name="answer">The answer to bind. The server hashes it in-process and does not retain it.</param>
+    /// <param name="sourceDocIds">Live, readable source document ids in grounding order.</param>
+    /// <param name="share">Whether to explicitly create a public-safe share receipt.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task<GroundingReceipt> CreateGroundingReceiptAsync(
+        string answer,
+        IReadOnlyList<string> sourceDocIds,
+        bool share = false,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(answer))
+            throw new ArgumentException("answer cannot be empty", nameof(answer));
+        if (sourceDocIds is null || sourceDocIds.Count == 0)
+            throw new ArgumentException("sourceDocIds cannot be empty", nameof(sourceDocIds));
+
+        var request = new GroundingReceiptRequest
+        {
+            Answer = answer,
+            SourceDocIds = sourceDocIds,
+            Partition = _partition,
+            Share = share,
+        };
+        var json = JsonSerializer.Serialize(request, JsonOptions);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        return await RequestAsync<GroundingReceipt>(
+            "/audit/grounding",
+            HttpMethod.Post,
+            content,
+            cancellationToken,
+            retry: !share).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Revoke a public grounding receipt the current tenant owns. On success its
+    /// share URL and SVG badge return 404; unknown and foreign ids also 404.
+    /// </summary>
+    public async Task RevokeGroundingReceiptAsync(
+        string receiptId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(receiptId))
+            throw new ArgumentException("receiptId cannot be empty", nameof(receiptId));
+        await RequestVoidAsync(
+            AppendPartitionGuard($"/audit/receipts/{Uri.EscapeDataString(receiptId)}"),
+            HttpMethod.Delete,
+            cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Download a document as raw bytes.</summary>
@@ -1218,6 +1595,7 @@ public partial class AetherClient : IDisposable
     /// <param name="freshnessWeight">Blend freshness into ranking, in <c>[0, 1]</c>: boosts recently updated documents (<c>updated_at</c>, falling back to <c>created_at</c>). Composes with <paramref name="recencyWeight"/>; the server rejects a combined weight above 1. May require a Scale plan or higher.</param>
     /// <param name="freshnessHalfLifeDays">Freshness decay half-life in days (must be &gt; 0); the age at which the freshness contribution halves. Only meaningful when <paramref name="freshnessWeight"/> &gt; 0. Server default is 14 when omitted.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
+    /// <param name="threadId">Optional conversation identity to restrict results to its turns.</param>
     public async Task<List<SearchResult>> SearchAsync(
         string query,
         int k = 10,
@@ -1235,7 +1613,8 @@ public partial class AetherClient : IDisposable
         double? halfLifeDays = null,
         double? freshnessWeight = null,
         double? freshnessHalfLifeDays = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? threadId = null)
     {
         if (string.IsNullOrEmpty(query))
             throw new ArgumentException("query cannot be empty", nameof(query));
@@ -1246,6 +1625,7 @@ public partial class AetherClient : IDisposable
             qs += $"&tags={Uri.EscapeDataString(string.Join(",", tags))}";
         qs = AppendMetadataFilters(qs, anyTags, contentTypes, sources);
         qs = AppendPartition(AppendSearchFilters(qs, entityId, since, until, lastNDays, maxDistance, recencyWeight, halfLifeDays, freshnessWeight, freshnessHalfLifeDays, filter));
+        qs = AppendThreadSearchFilter(qs, threadId);
         var response = await RequestAsync<SearchResponse>(
             $"/search?{qs}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
         StampQueryId(response.Results, response.QueryId);
@@ -1307,8 +1687,9 @@ public partial class AetherClient : IDisposable
     }
 
     /// <summary>Search with content retrieval. Results are deduplicated by DocId
-    /// (highest-scoring match wins). Falls back to <see cref="DownloadAsync"/>
-    /// for results missing inline content.</summary>
+    /// (highest-scoring match wins). Text falls back to <see cref="DownloadAsync"/>
+    /// while media falls back to metadata <c>DerivedText</c>; original media is
+    /// never decoded as UTF-8.</summary>
     /// <param name="query">Natural language search query.</param>
     /// <param name="k">Maximum number of results to return. Default: 5.</param>
     /// <param name="tags">Optional tags to filter results.</param>
@@ -1325,6 +1706,7 @@ public partial class AetherClient : IDisposable
     /// <param name="freshnessWeight">Blend freshness (recent updates) into ranking, in <c>[0, 1]</c>; forwarded to search. Server default half-life is 14 days. See <see cref="SearchAsync"/>. May require a Scale plan or higher.</param>
     /// <param name="freshnessHalfLifeDays">Freshness decay half-life in days (&gt; 0); forwarded to search. See <see cref="SearchAsync"/>.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
+    /// <param name="threadId">Optional conversation identity to restrict results to its turns.</param>
     public async Task<List<RetrievalResult>> RetrieveAsync(
         string query,
         int k = 5,
@@ -1342,7 +1724,8 @@ public partial class AetherClient : IDisposable
         double? halfLifeDays = null,
         double? freshnessWeight = null,
         double? freshnessHalfLifeDays = null,
-        CancellationToken cancellationToken = default)
+        CancellationToken cancellationToken = default,
+        string? threadId = null)
     {
         if (string.IsNullOrEmpty(query))
             throw new ArgumentException("query cannot be empty", nameof(query));
@@ -1353,6 +1736,7 @@ public partial class AetherClient : IDisposable
             qs += $"&tags={Uri.EscapeDataString(string.Join(",", tags))}";
         qs = AppendMetadataFilters(qs, anyTags, contentTypes, sources);
         qs = AppendPartition(AppendSearchFilters(qs, entityId, since, until, lastNDays, maxDistance, recencyWeight, halfLifeDays, freshnessWeight, freshnessHalfLifeDays, filter));
+        qs = AppendThreadSearchFilter(qs, threadId);
         var response = await RequestAsync<SearchResponse>(
             $"/search?{qs}", HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
 
@@ -1367,8 +1751,24 @@ public partial class AetherClient : IDisposable
             var content = r.Content;
             if (content == null)
             {
-                var bytes = await DownloadAsync(r.DocId, cancellationToken).ConfigureAwait(false);
-                content = Encoding.UTF8.GetString(bytes);
+                if (!string.IsNullOrEmpty(r.Modality))
+                {
+                    if (r.Passage != null)
+                    {
+                        content = r.Passage;
+                    }
+                    else
+                    {
+                        var document = await GetAsync(r.DocId, cancellationToken).ConfigureAwait(false);
+                        content = document.DerivedText
+                            ?? throw new AetherException($"Media result {r.DocId} has no derived_text");
+                    }
+                }
+                else
+                {
+                    var bytes = await DownloadAsync(r.DocId, cancellationToken).ConfigureAwait(false);
+                    content = Encoding.UTF8.GetString(bytes);
+                }
             }
 
             results.Add(new RetrievalResult
@@ -1380,12 +1780,15 @@ public partial class AetherClient : IDisposable
                 ContentType = r.ContentType,
                 Passage = r.Passage,
                 EntityId = r.EntityId,
+                ThreadId = r.ThreadId,
+                TurnIndex = r.TurnIndex,
                 Tags = r.Tags,
                 Source = r.Source,
                 Partition = r.Partition,
                 Metadata = r.Metadata,
                 CreatedAt = r.CreatedAt,
                 UpdatedAt = r.UpdatedAt,
+                Modality = r.Modality,
             });
         }
 
@@ -1528,6 +1931,178 @@ public partial class AetherClient : IDisposable
             $"/partitions/{Uri.EscapeDataString(partitionId)}", HttpMethod.Delete,
             cancellationToken: cancellationToken).ConfigureAwait(false);
         return response.DocumentsDeleted;
+    }
+
+    // ── Connections + connect sessions ──
+
+    /// <summary>Mint a connect session — the entry point for connecting one
+    /// of the developer's end users' sources (mode B). Open the returned
+    /// <see cref="ConnectSession.ConnectUrl"/> in the end user's browser to
+    /// start the hosted OAuth flow.</summary>
+    /// <remarks>
+    /// On a partition handle, the handle's partition must equal the
+    /// placement this session will resolve to (<paramref name="externalUserId"/>,
+    /// or <paramref name="targetPartition"/> if given) — a scoped handle for
+    /// end user X can mint a session only for X.
+    /// <para><see cref="ConnectSession.ClientSecret"/> is returned exactly
+    /// once. Store it server-side; use it with
+    /// <see cref="AetherConnections.VerifyRedirectSignature"/> when the end
+    /// user lands back on <paramref name="returnUrl"/>.</para>
+    /// </remarks>
+    /// <param name="externalUserId">The developer's own id for the end user about to connect.</param>
+    /// <param name="returnUrl">Where the hosted connect page redirects the browser. Must be https:// (or http://localhost / http://127.0.0.1 for local development), no fragment.</param>
+    /// <param name="targetPartition">Override the partition this connection will sync into. Null uses the pinned mapping.</param>
+    /// <param name="provider">Defaults to <c>"dropbox"</c>, the only provider today.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    public async Task<ConnectSession> CreateConnectSessionAsync(
+        string externalUserId,
+        string returnUrl,
+        string? targetPartition = null,
+        string provider = "dropbox",
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(externalUserId))
+            throw new ArgumentException("externalUserId cannot be empty", nameof(externalUserId));
+        if (string.IsNullOrEmpty(returnUrl))
+            throw new ArgumentException("returnUrl cannot be empty", nameof(returnUrl));
+
+        var request = new CreateConnectSessionRequest
+        {
+            Provider = provider,
+            ExternalUserId = externalUserId,
+            ReturnUrl = returnUrl,
+            TargetPartition = targetPartition,
+        };
+        var json = JsonSerializer.Serialize(request, JsonOptions);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        return await RequestAsync<ConnectSession>(
+            AppendPartitionGuard("/connections/sessions"),
+            HttpMethod.Post,
+            content,
+            cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>List connections in scope: the whole tenant when unscoped,
+    /// or one partition's under a handle.</summary>
+    public async Task<IReadOnlyList<Connection>> ListConnectionsAsync(
+        ListConnectionsOptions? options = null,
+        CancellationToken cancellationToken = default)
+    {
+        options ??= new ListConnectionsOptions();
+        var qs = "";
+        if (!string.IsNullOrEmpty(options.OwnerType))
+            qs += $"&owner_type={Uri.EscapeDataString(options.OwnerType)}";
+        if (!string.IsNullOrEmpty(options.OwnerId))
+            qs += $"&owner_id={Uri.EscapeDataString(options.OwnerId)}";
+        if (!options.IncludePurged)
+            qs += "&include_purged=false";
+        qs = AppendPartition(qs);
+        var path = qs.Length > 0 ? $"/connections?{qs.TrimStart('&')}" : "/connections";
+        var response = await RequestAsync<ConnectionListResponse>(
+            path, HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+        return response.Connections;
+    }
+
+    /// <summary>Fetch one connection. On a handle, a connection in a
+    /// different partition returns the same 404 as an unknown id.</summary>
+    public async Task<Connection> GetConnectionAsync(
+        string connectionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(connectionId))
+            throw new ArgumentException("connectionId cannot be empty", nameof(connectionId));
+        return await RequestAsync<Connection>(
+            AppendPartitionGuard($"/connections/{Uri.EscapeDataString(connectionId)}"),
+            HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Disconnect: revoke upstream, destroy the stored credential,
+    /// hard-delete every document this connection synced, and issue a
+    /// signed purge receipt. Idempotent — disconnecting an already-purged
+    /// connection re-reports the same result. Fetch the full receipt with
+    /// <see cref="GetPurgeReceiptAsync"/>.</summary>
+    public async Task<DisconnectResult> DeleteConnectionAsync(
+        string connectionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(connectionId))
+            throw new ArgumentException("connectionId cannot be empty", nameof(connectionId));
+        return await RequestAsync<DisconnectResult>(
+            AppendPartitionGuard($"/connections/{Uri.EscapeDataString(connectionId)}"),
+            HttpMethod.Delete, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Re-drive sync for one connection. Honest, narrow semantics:
+    /// this clears the connection's backoff and (if it was paused/errored)
+    /// flips it back to active — it does <b>not</b> run a sync inline. The
+    /// connection becomes eligible on the sync loop's next scheduled
+    /// pass.</summary>
+    public async Task<Connection> ResyncConnectionAsync(
+        string connectionId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(connectionId))
+            throw new ArgumentException("connectionId cannot be empty", nameof(connectionId));
+        await RequestAsync<ResyncResponse>(
+            AppendPartitionGuard($"/connections/{Uri.EscapeDataString(connectionId)}/resync"),
+            HttpMethod.Post, cancellationToken: cancellationToken).ConfigureAwait(false);
+        // The resync response is slim; fetch the full record so callers get
+        // one consistent shape everywhere.
+        return await GetConnectionAsync(connectionId, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>One page of a connection's source folder listing, for a
+    /// folder-picker UI. A null cursor browses <paramref name="path"/>
+    /// fresh; pass back <see cref="ConnectionBrowsePage.NextCursor"/> to
+    /// continue.</summary>
+    public async Task<ConnectionBrowsePage> BrowseConnectionAsync(
+        string connectionId,
+        string path = "",
+        string? cursor = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(connectionId))
+            throw new ArgumentException("connectionId cannot be empty", nameof(connectionId));
+        var request = new BrowseConnectionRequest { Path = path, Cursor = cursor };
+        var json = JsonSerializer.Serialize(request, JsonOptions);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        return await RequestAsync<ConnectionBrowsePage>(
+            AppendPartitionGuard($"/connections/{Uri.EscapeDataString(connectionId)}/browse"),
+            HttpMethod.Post, content, cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Replace a connection's synced-path scope outright (not a
+    /// merge — send the full intended set; an empty list means the whole
+    /// account). Returns the normalized list actually stored.</summary>
+    public async Task<IReadOnlyList<string>> UpdateSelectionAsync(
+        string connectionId,
+        IReadOnlyList<string> selectedPaths,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(connectionId))
+            throw new ArgumentException("connectionId cannot be empty", nameof(connectionId));
+        var request = new UpdateSelectionRequest { SelectedPaths = selectedPaths ?? new List<string>() };
+        var json = JsonSerializer.Serialize(request, JsonOptions);
+        using var content = new StringContent(json, Encoding.UTF8, "application/json");
+        var response = await RequestAsync<SelectionResponse>(
+            AppendPartitionGuard($"/connections/{Uri.EscapeDataString(connectionId)}/selection"),
+            HttpMethod.Put, content, cancellationToken).ConfigureAwait(false);
+        return response.SelectedPaths;
+    }
+
+    /// <summary>Fetch a connection's disconnect-purge receipt — the full
+    /// signed proof, including every purged document id, the Merkle root,
+    /// the Ed25519 signature, and the node's own
+    /// <see cref="ConnectionPurgeReceipt.Verified"/> re-check.</summary>
+    public async Task<ConnectionPurgeReceipt> GetPurgeReceiptAsync(
+        string receiptId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(receiptId))
+            throw new ArgumentException("receiptId cannot be empty", nameof(receiptId));
+        return await RequestAsync<ConnectionPurgeReceipt>(
+            AppendPartitionGuard($"/connections/purge-receipts/{Uri.EscapeDataString(receiptId)}"),
+            HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>Insert a document with precomputed embeddings (BYOE — bring your own embeddings).</summary>
@@ -1734,6 +2309,11 @@ public partial class AetherClient : IDisposable
     {
         if (queries is null || queries.Count == 0)
             throw new ArgumentException("queries cannot be null or empty", nameof(queries));
+        foreach (var query in queries)
+        {
+            if (query.ThreadId is not null)
+                ValidateThreadId(query.ThreadId, nameof(BatchSearchQuery.ThreadId));
+        }
         // When scoped, every query carries the same partition (per-query wire
         // field). Project into fresh queries so the caller's input objects are
         // never mutated (a reused list stays unscoped on an unscoped client).
@@ -1753,6 +2333,7 @@ public partial class AetherClient : IDisposable
                     Filter = q.Filter,
                     IncludeContent = q.IncludeContent,
                     EntityId = q.EntityId,
+                    ThreadId = q.ThreadId,
                     Since = q.Since,
                     Until = q.Until,
                     LastNDays = q.LastNDays,

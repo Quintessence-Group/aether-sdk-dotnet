@@ -45,7 +45,9 @@ jobs:
         run: dotnet test -c Release --no-build
 
       - name: Pack
-        run: dotnet pack src/Aether.Sdk/Aether.Sdk.csproj -c Release -o ./artifacts
+        run: |
+          dotnet pack src/Aether.Sdk/Aether.Sdk.csproj -c Release -o ./artifacts
+          dotnet pack src/Aether.Sdk.SemanticKernel/Aether.Sdk.SemanticKernel.csproj -c Release -o ./artifacts
 
       - name: NuGet login (OIDC → short-lived key)
         id: nuget-login

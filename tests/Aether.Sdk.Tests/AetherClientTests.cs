@@ -829,6 +829,223 @@ public class AetherClientTests
         Assert.Equal(HttpStatusCode.NotFound, ex.StatusCode);
     }
 
+    [Fact]
+    public async Task CreateGroundingReceipt_PostsDeclaredSourcesAndParsesPublicSafeReceipt()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new
+        {
+            answer_digest = "blake3:answer-commitment",
+            sources = new[]
+            {
+                new
+                {
+                    document_id = "doc-1",
+                    content_id = "aether:private-cid",
+                    rank = 0,
+                    retained_signed_event_count = 2,
+                    current_content_verified = true,
+                    proof = new
+                    {
+                        content_id = "aether:private-cid",
+                        lamport = 42,
+                        node_id = "source-node-id",
+                        public_key = "source-public-key",
+                        signature = "source-signature",
+                        verified = true,
+                    },
+                },
+            },
+            trust = new
+            {
+                status = "verified",
+                sources_requested = 1,
+                sources_verified = 1,
+                answer_bound = true,
+            },
+            binding = new
+            {
+                algorithm = "blake3-keyed/aether-grounding-binding/v1",
+                source_set_commitment = "blake3:sources",
+                source_evidence_commitment = "blake3:evidence",
+                binding_commitment = "opaque-binding",
+                verification_salt = "authenticated-only-salt",
+            },
+            attestation = new
+            {
+                version = "aether-grounding-set-attestation/v1",
+                issued_at = "2026-07-10T00:00:00Z",
+                binding_algorithm = "blake3-keyed/aether-grounding-binding/v1",
+                signer_node_id = "grounding-node-id",
+                signer_public_key = "grounding-public-key",
+                signature = "grounding-signature",
+                verified = true,
+            },
+            receipt = new
+            {
+                version = "aether-grounding-receipt/v2",
+                receipt_id = "receipt-1",
+                issued_at = "2026-07-10T00:00:00Z",
+                expires_at = "2026-08-09T00:00:00Z",
+                source_count = 1,
+                verified_source_count = 1,
+                status = "verified",
+                binding_commitment = "opaque-binding",
+                capability_commitment = "blake3:capability",
+                owner_commitment = "blake3:owner",
+                attestation = new
+                {
+                    signer_node_id = "node-id",
+                    signer_public_key = "public-key",
+                    signature = "signature",
+                    verified = true,
+                },
+                share_url = "/receipts/capability",
+                badge_url = "/receipts/capability/badge.svg",
+            },
+        });
+
+        using var client = CreateClient(handler);
+        var result = await client.CreateGroundingReceiptAsync(
+            "private answer", new[] { "doc-1" }, share: true);
+
+        Assert.Contains("/v1/audit/grounding", handler.LastRequest!.RequestUri!.AbsolutePath);
+        using var request = JsonDocument.Parse(handler.LastRequestBody!);
+        Assert.Equal("private answer", request.RootElement.GetProperty("answer").GetString());
+        Assert.Equal("doc-1", request.RootElement.GetProperty("source_doc_ids")[0].GetString());
+        Assert.True(request.RootElement.GetProperty("share").GetBoolean());
+        Assert.Equal("aether:private-cid", result.Sources[0].ContentId);
+        var sourceProof = Assert.IsType<AuditProof>(result.Sources[0].Proof);
+        Assert.Equal(42UL, sourceProof.Lamport);
+        Assert.True(sourceProof.Verified);
+        Assert.Equal("verified", result.Trust.Status);
+        Assert.Equal("blake3:evidence", result.Binding.SourceEvidenceCommitment);
+        Assert.Equal("opaque-binding", result.Binding.BindingCommitment);
+        Assert.Equal("grounding-signature", result.Attestation.Signature);
+        Assert.True(result.Attestation.Verified);
+        var publicReceipt = Assert.IsType<ShareableReceipt>(result.Receipt);
+        Assert.Equal("/receipts/capability", publicReceipt.ShareUrl);
+        Assert.Equal("blake3:capability", publicReceipt.CapabilityCommitment);
+        Assert.Equal("blake3:owner", publicReceipt.OwnerCommitment);
+        Assert.True(publicReceipt.Attestation.Verified);
+    }
+
+    [Theory]
+    [InlineData(502)]
+    [InlineData(503)]
+    public async Task GroundingReceipt_ShareDoesNotRetryTransientResponse(int status)
+    {
+        int attempts = 0;
+        var handler = new MockHttpMessageHandler(_ =>
+        {
+            attempts++;
+            if (attempts == 1)
+            {
+                return new HttpResponseMessage((HttpStatusCode)status)
+                {
+                    Content = new StringContent(
+                        $"{{\"error\":\"first-{status}\"}}",
+                        Encoding.UTF8,
+                        "application/json"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"answer_digest\":\"unexpected\",\"sources\":[],\"trust\":{},\"binding\":{},\"attestation\":{}}",
+                    Encoding.UTF8,
+                    "application/json"),
+            };
+        });
+        using var client = CreateClient(handler);
+
+        var ex = await Assert.ThrowsAsync<AetherApiException>(() =>
+            client.CreateGroundingReceiptAsync("answer", new[] { "doc-1" }, share: true));
+
+        Assert.Equal((HttpStatusCode)status, ex.StatusCode);
+        Assert.Equal($"first-{status}", ex.Body);
+        Assert.Equal(1, attempts);
+    }
+
+    [Theory]
+    [InlineData(502)]
+    [InlineData(503)]
+    public async Task GroundingReceipt_PrivateRetainsTransientRetry(int status)
+    {
+        int attempts = 0;
+        var handler = new MockHttpMessageHandler(_ =>
+        {
+            attempts++;
+            if (attempts == 1)
+            {
+                return new HttpResponseMessage((HttpStatusCode)status)
+                {
+                    Content = new StringContent(
+                        $"{{\"error\":\"transient-{status}\"}}",
+                        Encoding.UTF8,
+                        "application/json"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.OK)
+            {
+                Content = new StringContent(
+                    "{\"answer_digest\":\"blake3:retried\",\"sources\":[],\"trust\":{},\"binding\":{},\"attestation\":{}}",
+                    Encoding.UTF8,
+                    "application/json"),
+            };
+        });
+        using var client = CreateClient(handler);
+
+        var receipt = await client.CreateGroundingReceiptAsync(
+            "answer", new[] { "doc-1" });
+
+        Assert.Equal("blake3:retried", receipt.AnswerDigest);
+        Assert.Equal(2, attempts);
+    }
+
+    [Fact]
+    public async Task RevokeGroundingReceipt_UsesVoidDeleteAndValidatesIds()
+    {
+        var handler = new MockHttpMessageHandler(_ => new HttpResponseMessage(HttpStatusCode.NoContent));
+        using var client = CreateClient(handler);
+        await client.RevokeGroundingReceiptAsync("receipt-1");
+
+        Assert.Contains("/v1/audit/receipts/receipt-1", handler.LastRequest!.RequestUri!.AbsolutePath);
+        Assert.Equal(HttpMethod.Delete, handler.LastRequest.Method);
+        await Assert.ThrowsAsync<ArgumentException>(() => client.RevokeGroundingReceiptAsync(""));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.CreateGroundingReceiptAsync("", new[] { "doc-1" }));
+        await Assert.ThrowsAsync<ArgumentException>(
+            () => client.CreateGroundingReceiptAsync("answer", Array.Empty<string>()));
+    }
+
+    [Fact]
+    public async Task GroundingReceipt_PartitionHandleScopesCreateAndRevoke()
+    {
+        var handler = new MockHttpMessageHandler(request =>
+        {
+            if (request.Method == HttpMethod.Post)
+            {
+                return new HttpResponseMessage(HttpStatusCode.OK)
+                {
+                    Content = new StringContent(
+                        "{\"answer_digest\":\"blake3:answer\",\"sources\":[],\"trust\":{},\"binding\":{}}",
+                        Encoding.UTF8,
+                        "application/json"),
+                };
+            }
+            return new HttpResponseMessage(HttpStatusCode.NoContent);
+        });
+        using var root = CreateClient(handler);
+        using var scoped = root.Partition("customer-a");
+        await scoped.CreateGroundingReceiptAsync("answer", new[] { "doc-1" });
+        using (var body = JsonDocument.Parse(handler.LastRequestBody!))
+        {
+            Assert.Equal("customer-a", body.RootElement.GetProperty("partition").GetString());
+        }
+        await scoped.RevokeGroundingReceiptAsync("receipt-1");
+        Assert.Contains("partition=customer-a", handler.LastRequest!.RequestUri!.Query);
+    }
+
     // ── Download ──────────────────────────────────────────────────
 
     [Fact]
@@ -2039,6 +2256,7 @@ public class AetherClientTests
                 Q = "test",
                 K = 5,
                 EntityId = "acct/42",
+                ThreadId = "support-42",
                 Since = "2026-06-01T00:00:00Z",
                 Until = "2026-06-10T23:59:59Z",
                 LastNDays = 7,
@@ -2048,6 +2266,7 @@ public class AetherClientTests
 
         var body = handler.LastRequestBody!;
         Assert.Contains("\"entity_id\":\"acct/42\"", body);
+        Assert.Contains("\"thread_id\":\"support-42\"", body);
         Assert.Contains("\"since\":\"2026-06-01T00:00:00Z\"", body);
         Assert.Contains("\"until\":\"2026-06-10T23:59:59Z\"", body);
         Assert.Contains("\"last_n_days\":7", body);
@@ -2070,10 +2289,25 @@ public class AetherClientTests
 
         var body = handler.LastRequestBody!;
         Assert.DoesNotContain("entity_id", body);
+        Assert.DoesNotContain("thread_id", body);
         Assert.DoesNotContain("since", body);
         Assert.DoesNotContain("until", body);
         Assert.DoesNotContain("last_n_days", body);
         Assert.DoesNotContain("max_distance", body);
+    }
+
+    [Fact]
+    public async Task BatchSearchAsync_RejectsInvalidThreadIdBeforeRequest()
+    {
+        var handler = MockHttpMessageHandler.WithJson(new { results = Array.Empty<object>() });
+        var client = CreateClient(handler);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => client.BatchSearchAsync(new List<BatchSearchQuery>
+        {
+            new() { Q = "test", ThreadId = "bad\0thread" },
+        }));
+
+        Assert.Null(handler.LastRequest);
     }
 
     // On /search/batch the per-query metadata filters are sent as comma-joined
@@ -2427,13 +2661,15 @@ public class AetherClientTests
 
         await client.Partition("tenant-x").BatchSearchAsync(new List<BatchSearchQuery>
         {
-            new() { Q = "a", K = 5 },
-            new() { Q = "b", K = 5 },
+            new() { Q = "a", K = 5, ThreadId = "thread-a" },
+            new() { Q = "b", K = 5, ThreadId = "thread-b" },
         });
 
         var body = handler.LastRequestBody!;
         var occurrences = body.Split(new[] { "\"partition\":\"tenant-x\"" }, StringSplitOptions.None).Length - 1;
         Assert.Equal(2, occurrences);
+        Assert.Contains("\"thread_id\":\"thread-a\"", body);
+        Assert.Contains("\"thread_id\":\"thread-b\"", body);
     }
 
     [Fact]

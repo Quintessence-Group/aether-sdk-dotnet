@@ -146,6 +146,163 @@ public class MemoryTests
         Assert.Contains("tags=url:https://example.com", query);
     }
 
+    // ── Multimodal memory ───────────────────────────────────────
+
+    [Fact]
+    public async Task RememberImage_UsesMediaRouteAndReturnsModality()
+    {
+        var handler = new RoutingHandler((_, __) => Json(new
+        {
+            doc_id = "media-1",
+            cid = "cid-media",
+            modality = "image",
+            content_type = "image/png",
+            derived_text = "A red bicycle.",
+            derived_by = "client",
+            created_at = "2026-06-15T12:00:00Z",
+            entity_id = "patient-john",
+            partition = (string?)null,
+            metadata = new Dictionary<string, object?> { ["aether.media.modality"] = "image" },
+        }, HttpStatusCode.Created));
+        var mem = CreateMemory("patient-john", handler);
+        var png = new byte[] { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
+
+        var item = await mem.RememberImageAsync(png, caption: "A red bicycle.");
+
+        Assert.Equal("image", item.Modality);
+        Assert.Equal("A red bicycle.", item.Text);
+        var request = handler.Requests.Single();
+        Assert.Equal("/v1/memory/media", PathOf(request.Uri));
+        Assert.Contains("entity_id=patient-john", request.Uri.Query);
+        using var body = JsonDocument.Parse(request.Body!);
+        Assert.Equal("image", body.RootElement.GetProperty("modality").GetString());
+        Assert.Equal("image/png", body.RootElement.GetProperty("content_type").GetString());
+        Assert.Equal(png, Convert.FromBase64String(body.RootElement.GetProperty("data_base64").GetString()!));
+    }
+
+    [Fact]
+    public async Task RecallMedia_UsesIndexedPassageWithoutBinaryDownload()
+    {
+        var handler = new RoutingHandler((request, _) =>
+        {
+            Assert.Equal("/v1/search", PathOf(request.RequestUri!));
+            return Json(new
+            {
+                query = "bicycle",
+                results = new[]
+                {
+                    new
+                    {
+                        doc_id = "media-1",
+                        score = 96,
+                        content_type = "image/png",
+                        passage = "A red bicycle.",
+                        modality = "image",
+                    },
+                },
+            });
+        });
+        var mem = CreateMemory("patient-john", handler);
+
+        var items = await mem.RecallAsync("bicycle");
+
+        Assert.Single(handler.Requests);
+        Assert.Equal("A red bicycle.", items.Single().Text);
+        Assert.Equal("image", items.Single().Modality);
+    }
+
+    [Fact]
+    public async Task RecallMedia_MissingPassageUsesMetadataNotBinaryDownload()
+    {
+        var handler = new RoutingHandler((request, _) =>
+        {
+            var path = PathOf(request.RequestUri!);
+            return path switch
+            {
+                "/v1/search" => Json(new
+                {
+                    query = "bicycle",
+                    results = new[]
+                    {
+                        new
+                        {
+                            doc_id = "media-1",
+                            score = 96,
+                            content_type = "image/png",
+                            modality = "image",
+                        },
+                    },
+                }),
+                "/v1/documents/media-1" => Json(new
+                {
+                    doc_id = "media-1",
+                    cid = "cid-media",
+                    content_type = "image/png",
+                    size_bytes = 100,
+                    chunks = 1,
+                    vectors = 1,
+                    version = 1,
+                    modality = "image",
+                    derived_text = "A red bicycle.",
+                }),
+                _ => throw new Xunit.Sdk.XunitException($"Unexpected path {path}"),
+            };
+        });
+        var mem = CreateMemory("patient-john", handler);
+
+        var items = await mem.RecallAsync("bicycle");
+
+        Assert.Equal(2, handler.Requests.Count);
+        Assert.DoesNotContain(handler.Requests, request =>
+            PathOf(request.Uri).Contains("/download", StringComparison.Ordinal));
+        Assert.Equal("A red bicycle.", items.Single().Text);
+    }
+
+    [Fact]
+    public async Task ListMedia_UsesDerivedTextWithoutBinaryDownload()
+    {
+        var handler = new RoutingHandler((request, _) =>
+        {
+            Assert.Equal("/v1/documents", PathOf(request.RequestUri!));
+            return Json(new
+            {
+                documents = new[]
+                {
+                    new
+                    {
+                        doc_id = "media-1",
+                        cid = "cid-media",
+                        content_type = "audio/wav",
+                        modality = "audio",
+                        derived_text = "Session transcript.",
+                        entity_id = "patient-john",
+                    },
+                },
+                total = 1,
+                has_more = false,
+            });
+        });
+        var mem = CreateMemory("patient-john", handler);
+
+        var items = await mem.ListAsync();
+
+        Assert.Single(handler.Requests);
+        Assert.Equal("Session transcript.", items.Single().Text);
+        Assert.Equal("audio", items.Single().Modality);
+    }
+
+    [Fact]
+    public async Task AudioWithoutTranscriptionOrTranscriptFailsBeforeHttp()
+    {
+        var handler = new RoutingHandler((_, __) => Json(new { }));
+        var mem = CreateMemory("patient-john", handler);
+
+        await Assert.ThrowsAsync<ArgumentException>(() => mem.RememberAudioAsync(
+            new byte[] { 1 }, transcribe: false, contentType: "audio/wav"));
+
+        Assert.Empty(handler.Requests);
+    }
+
     // ── ExtractFacts constructor default + per-call override ───────────────
 
     private static HttpResponseMessage InsertJson() => Json(new
