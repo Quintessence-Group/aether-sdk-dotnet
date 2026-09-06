@@ -57,6 +57,8 @@ public class AetherApiException : AetherException
             (402, "free_limit_exceeded") => new FreeLimitExceededException(statusCode, body, errorCode),
             (403, "tenant_paused") => new TenantPausedException(statusCode, body, errorCode),
             (400, "partition_required") => new PartitionRequiredException(statusCode, body, errorCode),
+            (400, "session_invalid") => new SessionInvalidException(statusCode, body, errorCode),
+            (400, "partition_mismatch") => new PartitionMismatchException(statusCode, body, errorCode),
             _ => new AetherApiException(statusCode, body, errorCode),
         };
     }
@@ -108,6 +110,32 @@ public class TenantPausedException : AetherApiException
 public class PartitionRequiredException : AetherApiException
 {
     public PartitionRequiredException(HttpStatusCode statusCode, string body, string? errorCode = null)
+        : base(statusCode, body, errorCode) { }
+}
+
+/// <summary>
+/// Thrown when a connect-session token is unknown, already consumed, or
+/// expired (HTTP 400, <c>code = "session_invalid"</c>). The three cases are
+/// deliberately indistinguishable — mint a new session with
+/// <see cref="AetherClient.CreateConnectSessionAsync"/> rather than retrying
+/// the same token.
+/// </summary>
+public class SessionInvalidException : AetherApiException
+{
+    public SessionInvalidException(HttpStatusCode statusCode, string body, string? errorCode = null)
+        : base(statusCode, body, errorCode) { }
+}
+
+/// <summary>
+/// Thrown when <see cref="AetherClient.CreateConnectSessionAsync"/>'s
+/// asserted partition (from a partition handle) disagrees with the
+/// partition the session would actually resolve to (HTTP 400,
+/// <c>code = "partition_mismatch"</c>). Mint on a handle scoped to the same
+/// external user id you are passing, or omit the handle.
+/// </summary>
+public class PartitionMismatchException : AetherApiException
+{
+    public PartitionMismatchException(HttpStatusCode statusCode, string body, string? errorCode = null)
         : base(statusCode, body, errorCode) { }
 }
 

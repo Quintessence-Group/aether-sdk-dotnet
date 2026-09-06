@@ -34,6 +34,25 @@ public class MemoryItem
     /// <c>recall</c> only; null for <c>remember</c>/<c>list</c>.
     /// </summary>
     public double? Score { get; set; }
+
+    /// <summary><c>image</c> or <c>audio</c> for multimodal memories.</summary>
+    public string? Modality { get; set; }
+}
+
+/// <summary>One multimodal input for <see cref="Memory.RememberAsync(MediaMemoryInput, CancellationToken)"/>.</summary>
+public sealed class MediaMemoryInput
+{
+    /// <summary>Image bytes. Exactly one of <see cref="Image"/> or <see cref="Audio"/> is required.</summary>
+    public byte[]? Image { get; set; }
+    /// <summary>Audio bytes. Exactly one of <see cref="Image"/> or <see cref="Audio"/> is required.</summary>
+    public byte[]? Audio { get; set; }
+    public string? Caption { get; set; }
+    public string? Transcript { get; set; }
+    public bool Transcribe { get; set; } = true;
+    public string? ContentType { get; set; }
+    public string? Filename { get; set; }
+    public IReadOnlyDictionary<string, object?>? Metadata { get; set; }
+    public string? Source { get; set; }
 }
 
 /// <summary>
@@ -75,8 +94,9 @@ public class MemoryOptions : AetherClientOptions
 /// </summary>
 /// <remarks>
 /// <para>
-/// <see cref="Memory"/> <b>owns</b> a raw client (composition, not inheritance). It
-/// adds no new HTTP routes and changes no existing raw-client behavior: all
+/// <see cref="Memory"/> <b>owns</b> a raw client (composition, not inheritance).
+/// Text calls compose document routes and media calls use the additive media route;
+/// it changes no existing raw-client behavior, and all
 /// transport, retry, error, and timeout semantics are inherited unchanged, and the
 /// raw client's existing error types surface through it unmodified.
 /// </para>
@@ -103,6 +123,14 @@ public class Memory : IDisposable
 
     /// <summary>The entity ID every operation is scoped to. Fixed at construction.</summary>
     public string EntityId => _entityId;
+
+    /// <summary>
+    /// Create an entity-scoped ordered conversation helper. Equivalent to
+    /// <c>new Thread(this, threadId)</c>.
+    /// </summary>
+    public Thread Thread(string threadId) => new(this, threadId);
+
+    internal AetherClient RawClientForThread => _client;
 
     /// <summary>
     /// Creates a memory for <paramref name="entityId"/>, building its own
@@ -217,6 +245,153 @@ public class Memory : IDisposable
         return RememberAsync(text, typed, extract, cancellationToken);
     }
 
+    /// <summary>
+    /// Store image or audio bytes on the same entity-scoped memory surface.
+    /// Omitting <see cref="MediaMemoryInput.Caption"/> or
+    /// <see cref="MediaMemoryInput.Transcript"/> asks the server's configured
+    /// VLM/transcription route to derive the indexed text.
+    /// </summary>
+    public async Task<MemoryItem> RememberAsync(
+        MediaMemoryInput input,
+        CancellationToken cancellationToken = default)
+    {
+        if (input == null) throw new ArgumentNullException(nameof(input));
+        var hasImage = input.Image != null;
+        var hasAudio = input.Audio != null;
+        if (hasImage == hasAudio)
+            throw new ArgumentException("provide exactly one of Image or Audio", nameof(input));
+        var modality = hasImage ? "image" : "audio";
+        var bytes = input.Image ?? input.Audio!;
+        if (bytes.Length == 0)
+            throw new ArgumentException("media cannot be empty", nameof(input));
+        if (modality == "audio" && !input.Transcribe && input.Transcript == null)
+            throw new ArgumentException("Transcribe=false requires an explicit Transcript", nameof(input));
+        if (modality == "image" && input.Transcript != null)
+            throw new ArgumentException("Transcript is valid only for audio memories", nameof(input));
+        if (modality == "audio" && input.Caption != null)
+            throw new ArgumentException("Caption is valid only for image memories", nameof(input));
+        var contentType = ResolveMediaContentType(bytes, modality, input.ContentType, input.Filename);
+        var tags = EncodeMetadata(input.Metadata);
+        var record = await _client.RememberMediaAsync(
+            bytes,
+            modality,
+            contentType,
+            _entityId,
+            filename: input.Filename,
+            caption: input.Caption,
+            transcript: input.Transcript,
+            tags: tags,
+            metadata: input.Metadata,
+            source: input.Source,
+            cancellationToken: cancellationToken).ConfigureAwait(false);
+        return new MemoryItem
+        {
+            Id = record.DocId,
+            Text = record.DerivedText,
+            CreatedAt = record.CreatedAt,
+            EntityId = record.EntityId ?? _entityId,
+            Metadata = record.Metadata.Count > 0
+                ? record.Metadata
+                : (input.Metadata?.ToDictionary(kv => kv.Key, kv => kv.Value) ?? new Dictionary<string, object?>()),
+            Modality = record.Modality,
+        };
+    }
+
+    public Task<MemoryItem> RememberImageAsync(
+        byte[] image,
+        string? caption = null,
+        string? contentType = null,
+        string? filename = null,
+        IReadOnlyDictionary<string, object?>? metadata = null,
+        CancellationToken cancellationToken = default) =>
+        RememberAsync(new MediaMemoryInput
+        {
+            Image = image,
+            Caption = caption,
+            ContentType = contentType,
+            Filename = filename,
+            Metadata = metadata,
+        }, cancellationToken);
+
+    public Task<MemoryItem> RememberAudioAsync(
+        byte[] audio,
+        bool transcribe = true,
+        string? transcript = null,
+        string? contentType = null,
+        string? filename = null,
+        IReadOnlyDictionary<string, object?>? metadata = null,
+        CancellationToken cancellationToken = default) =>
+        RememberAsync(new MediaMemoryInput
+        {
+            Audio = audio,
+            Transcribe = transcribe,
+            Transcript = transcript,
+            ContentType = contentType,
+            Filename = filename,
+            Metadata = metadata,
+        }, cancellationToken);
+
+    public Task<MemoryItem> RememberImageFileAsync(
+        string path,
+        string? caption = null,
+        string? contentType = null,
+        IReadOnlyDictionary<string, object?>? metadata = null,
+        CancellationToken cancellationToken = default) =>
+        RememberImageAsync(File.ReadAllBytes(path), caption, contentType, Path.GetFileName(path), metadata, cancellationToken);
+
+    public Task<MemoryItem> RememberAudioFileAsync(
+        string path,
+        bool transcribe = true,
+        string? transcript = null,
+        string? contentType = null,
+        IReadOnlyDictionary<string, object?>? metadata = null,
+        CancellationToken cancellationToken = default) =>
+        RememberAudioAsync(File.ReadAllBytes(path), transcribe, transcript, contentType, Path.GetFileName(path), metadata, cancellationToken);
+
+    private static string ResolveMediaContentType(
+        byte[] bytes,
+        string modality,
+        string? explicitType,
+        string? filename)
+    {
+        if (!string.IsNullOrWhiteSpace(explicitType))
+            return explicitType!.Split(';')[0].Trim().ToLowerInvariant();
+        var extension = Path.GetExtension(filename ?? string.Empty).ToLowerInvariant();
+        var byExtension = modality == "image"
+            ? new Dictionary<string, string> { [".jpg"] = "image/jpeg", [".jpeg"] = "image/jpeg", [".png"] = "image/png", [".webp"] = "image/webp", [".gif"] = "image/gif" }
+            : new Dictionary<string, string> { [".mp3"] = "audio/mpeg", [".m4a"] = "audio/mp4", [".mp4"] = "audio/mp4", [".wav"] = "audio/wav", [".webm"] = "audio/webm", [".ogg"] = "audio/ogg", [".flac"] = "audio/flac" };
+        if (byExtension.TryGetValue(extension, out var mime)) return mime;
+        if (modality == "image")
+        {
+            if (StartsWith(bytes, 0x89, 0x50, 0x4e, 0x47)) return "image/png";
+            if (StartsWith(bytes, 0xff, 0xd8, 0xff)) return "image/jpeg";
+            if (AsciiAt(bytes, 0, "GIF87a") || AsciiAt(bytes, 0, "GIF89a")) return "image/gif";
+            if (AsciiAt(bytes, 0, "RIFF") && AsciiAt(bytes, 8, "WEBP")) return "image/webp";
+        }
+        else
+        {
+            if (AsciiAt(bytes, 0, "RIFF") && AsciiAt(bytes, 8, "WAVE")) return "audio/wav";
+            if (AsciiAt(bytes, 0, "ID3") || StartsWith(bytes, 0xff, 0xfb)) return "audio/mpeg";
+            if (AsciiAt(bytes, 0, "OggS")) return "audio/ogg";
+            if (AsciiAt(bytes, 0, "fLaC")) return "audio/flac";
+        }
+        throw new ArgumentException("contentType is required for unrecognized media bytes", nameof(explicitType));
+    }
+
+    private static bool StartsWith(byte[] bytes, params byte[] prefix)
+    {
+        if (bytes.Length < prefix.Length) return false;
+        for (var i = 0; i < prefix.Length; i++) if (bytes[i] != prefix[i]) return false;
+        return true;
+    }
+
+    private static bool AsciiAt(byte[] bytes, int offset, string value)
+    {
+        if (bytes.Length < offset + value.Length) return false;
+        for (var i = 0; i < value.Length; i++) if (bytes[offset + i] != (byte)value[i]) return false;
+        return true;
+    }
+
     private static IReadOnlyList<string>? EncodeMetadata(IReadOnlyDictionary<string, object?>? metadata)
     {
         if (metadata is null || metadata.Count == 0)
@@ -299,6 +474,7 @@ public class Memory : IDisposable
                     EntityId = _entityId,
                     Metadata = h.Metadata,
                     Score = Similarity(h.Score),
+                    Modality = h.Modality,
                 });
             }
             return items;
@@ -366,6 +542,7 @@ public class Memory : IDisposable
                 EntityId = _entityId,
                 Metadata = s.Candidate.Metadata,
                 Score = s.Blended,
+                Modality = s.Candidate.Modality,
             });
         }
 
@@ -449,11 +626,16 @@ public class Memory : IDisposable
         if (records.Count > limit)
             records = records.GetRange(0, limit);
 
-        // Download text per record (parallelized), preserving newest-first order.
-        var downloadTasks = records
-            .Select(r => _client.DownloadAsync(r.DocId, cancellationToken))
-            .ToArray();
-        var payloads = await Task.WhenAll(downloadTasks).ConfigureAwait(false);
+        // Media downloads are original binary assets; list uses the authorized
+        // indexed caption/transcript exposed as DerivedText instead.
+        var contentTasks = records.Select(async r =>
+        {
+            if (!string.IsNullOrEmpty(r.Modality) && r.DerivedText != null)
+                return r.DerivedText;
+            var payload = await _client.DownloadAsync(r.DocId, cancellationToken).ConfigureAwait(false);
+            return Encoding.UTF8.GetString(payload);
+        }).ToArray();
+        var texts = await Task.WhenAll(contentTasks).ConfigureAwait(false);
 
         var items = new List<MemoryItem>(records.Count);
         for (int i = 0; i < records.Count; i++)
@@ -462,11 +644,12 @@ public class Memory : IDisposable
             items.Add(new MemoryItem
             {
                 Id = r.DocId,
-                Text = Encoding.UTF8.GetString(payloads[i]),
+                Text = texts[i],
                 CreatedAt = r.CreatedAt,
                 EntityId = r.EntityId ?? _entityId,
                 Metadata = r.Metadata,
                 Score = null,
+                Modality = r.Modality,
             });
         }
 
@@ -924,4 +1107,209 @@ public class Memory : IDisposable
         }
         GC.SuppressFinalize(this);
     }
+}
+
+/// <summary>
+/// Entity-scoped ordered conversation composed over <see cref="Memory"/>.
+/// Recent turns and semantic matches are returned as one flat list of
+/// <see cref="MemoryItem"/> values suitable for prompt context.
+/// </summary>
+public sealed class Thread
+{
+    private const int DefaultThreadTurns = 10;
+    private const int SemanticMatches = 5;
+    private const int MaxThreadTurns = 1_000;
+    private const int ThreadDownloadConcurrency = 8;
+    private const int ThreadContextMaxBytes = 16 * 1024 * 1024;
+
+    private readonly Memory _memory;
+    private readonly AetherClient _client;
+
+    /// <summary>The canonical conversation identity.</summary>
+    public string ThreadId { get; }
+
+    /// <summary>Construct a helper directly; <see cref="Memory.Thread"/> is shorthand.</summary>
+    public Thread(Memory memory, string threadId)
+    {
+        _memory = memory ?? throw new ArgumentNullException(nameof(memory));
+        AetherClient.ValidateThreadId(threadId);
+        ThreadId = threadId;
+        _client = memory.RawClientForThread;
+    }
+
+    /// <summary>Append one turn, automatically scoped to the Memory's entity.</summary>
+    public async Task<MemoryItem> AppendAsync(
+        string text,
+        IReadOnlyDictionary<string, object?>? metadata = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(text))
+            throw new ArgumentException("text cannot be empty", nameof(text));
+
+        var metadataDictionary = metadata?.ToDictionary(pair => pair.Key, pair => pair.Value);
+        var record = await _client.AppendThreadAsync(
+            ThreadId,
+            new ThreadAppendRequest
+            {
+                Text = text,
+                Metadata = metadataDictionary,
+                EntityId = _memory.EntityId,
+            },
+            cancellationToken).ConfigureAwait(false);
+
+        return new MemoryItem
+        {
+            Id = record.DocId,
+            Text = text,
+            CreatedAt = record.CreatedAt,
+            EntityId = record.EntityId ?? _memory.EntityId,
+            Metadata = record.Metadata.Count > 0
+                ? record.Metadata
+                : (metadataDictionary ?? new Dictionary<string, object?>()),
+        };
+    }
+
+    /// <summary>
+    /// Return a bounded recent window followed by up to five additional
+    /// semantic matches from the same entity and thread. Document IDs are
+    /// de-duplicated; recent turns are chronological unless
+    /// <paramref name="recentFirst"/> is true. At most eight downloads run at
+    /// once and recent plus semantic content shares a 16 MiB UTF-8/body budget.
+    /// </summary>
+    public async Task<IReadOnlyList<MemoryItem>> ContextAsync(
+        string query,
+        int lastNTurns = DefaultThreadTurns,
+        bool recentFirst = false,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrWhiteSpace(query))
+            throw new ArgumentException("query cannot be empty", nameof(query));
+        if (lastNTurns < 1 || lastNTurns > MaxThreadTurns)
+            throw new ArgumentOutOfRangeException(
+                nameof(lastNTurns),
+                $"lastNTurns must be between 1 and {MaxThreadTurns}");
+
+        // Start both independent reads before awaiting either so the helper
+        // does not add avoidable latency to prompt assembly.
+        var recentTask = _client.GetThreadAsync(
+            ThreadId,
+            new ThreadReadOptions
+            {
+                LastNTurns = lastNTurns,
+                RecentFirst = recentFirst,
+            },
+            cancellationToken);
+        var semanticTask = _client.RetrieveAsync(
+            query,
+            k: SemanticMatches,
+            entityId: _memory.EntityId,
+            cancellationToken: cancellationToken,
+            threadId: ThreadId);
+
+        var conversation = await recentTask.ConfigureAwait(false);
+        var matches = await semanticTask.ConfigureAwait(false);
+        var records = conversation.Documents
+            .Where(record => record.EntityId == _memory.EntityId)
+            .ToList();
+        var payloads = new List<byte[]>(records.Count);
+        var contextBytes = 0;
+        for (int offset = 0; offset < records.Count; offset += ThreadDownloadConcurrency)
+        {
+            var batch = records
+                .Skip(offset)
+                .Take(ThreadDownloadConcurrency)
+                .Select(record => _client.DownloadAsync(record.DocId, cancellationToken));
+            var downloaded = await Task.WhenAll(batch).ConfigureAwait(false);
+            foreach (var payload in downloaded)
+            {
+                contextBytes = checked(contextBytes + payload.Length);
+                if (contextBytes > ThreadContextMaxBytes)
+                    throw new AetherException(
+                        $"thread context exceeds the {ThreadContextMaxBytes}-byte safety limit");
+            }
+            payloads.AddRange(downloaded);
+        }
+
+        var items = new List<MemoryItem>(records.Count + matches.Count);
+        var seen = new HashSet<string>(StringComparer.Ordinal);
+        for (int index = 0; index < records.Count; index++)
+        {
+            var record = records[index];
+            seen.Add(record.DocId);
+            items.Add(new MemoryItem
+            {
+                Id = record.DocId,
+                Text = Encoding.UTF8.GetString(payloads[index]),
+                CreatedAt = record.CreatedAt,
+                EntityId = record.EntityId ?? _memory.EntityId,
+                Metadata = record.Metadata,
+            });
+        }
+
+        foreach (var match in matches)
+        {
+            if (!seen.Add(match.DocId))
+                continue;
+            contextBytes = checked(contextBytes + Encoding.UTF8.GetByteCount(match.Content));
+            if (contextBytes > ThreadContextMaxBytes)
+                throw new AetherException(
+                    $"thread context exceeds the {ThreadContextMaxBytes}-byte safety limit");
+            items.Add(new MemoryItem
+            {
+                Id = match.DocId,
+                Text = match.Content,
+                EntityId = _memory.EntityId,
+                Metadata = match.Metadata,
+                Score = match.Score / 100.0,
+            });
+        }
+
+        return items;
+    }
+
+    // ── Whole-thread lifecycle ──────────────────────────────
+    //
+    // Owner/admin-scoped ops that act on the entire conversation, mirroring the
+    // append/context sugar over the raw client.
+
+    /// <summary>
+    /// Restore (un-tombstone) this whole thread so it is visible on <c>/threads</c>
+    /// again. Owner/admin-scoped.
+    /// </summary>
+    public Task<ThreadLifecycleResult> RestoreAsync(CancellationToken cancellationToken = default) =>
+        _client.ThreadRestoreAsync(ThreadId, cancellationToken: cancellationToken);
+
+    /// <summary>
+    /// Rewrite the intra-tenant read ACL on every turn of this thread.
+    /// <paramref name="readers"/> null unlabels (tenant-visible), an empty list
+    /// quarantines to admin-only, and a non-empty list restricts to those readers.
+    /// Owner/admin-scoped.
+    /// </summary>
+    public Task<ThreadLifecycleResult> SetAclAsync(
+        IReadOnlyList<string>? readers,
+        CancellationToken cancellationToken = default) =>
+        _client.ThreadAclAsync(ThreadId, readers, cancellationToken: cancellationToken);
+
+    /// <summary>
+    /// Move this whole thread to <paramref name="toPartition"/> (null names the
+    /// default partition). The facade asserts the thread currently lives in the
+    /// owning client's partition scope (<c>expect_partition</c>); a wrong assertion
+    /// is an oracle-free 404. Owner/admin-scoped.
+    /// </summary>
+    public Task<ThreadLifecycleResult> MoveAsync(
+        string? toPartition,
+        CancellationToken cancellationToken = default) =>
+        _client.ThreadMoveAsync(
+            ThreadId, _client.ScopedPartition, toPartition, cancellationToken: cancellationToken);
+
+    /// <summary>
+    /// Delete this whole thread. The default is a reversible soft tombstone
+    /// (restore with <see cref="RestoreAsync"/>); <paramref name="hard"/> = true
+    /// crypto-erases it irreversibly. Owner/admin-scoped.
+    /// </summary>
+    public Task<ThreadLifecycleResult> DeleteAsync(
+        bool hard = false,
+        CancellationToken cancellationToken = default) =>
+        _client.ThreadDeleteAsync(ThreadId, hard, cancellationToken: cancellationToken);
+
 }

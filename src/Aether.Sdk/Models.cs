@@ -31,6 +31,14 @@ public class DocumentRecord
     [JsonPropertyName("entity_id")]
     public string? EntityId { get; set; }
 
+    /// <summary>Conversation identity when this document is a thread turn.</summary>
+    [JsonPropertyName("thread_id")]
+    public string? ThreadId { get; set; }
+
+    /// <summary>Zero-based, server-assigned position within <see cref="ThreadId"/>.</summary>
+    [JsonPropertyName("turn_index")]
+    public ulong? TurnIndex { get; set; }
+
     /// <summary>The document's tags; empty when it has none.</summary>
     [JsonPropertyName("tags")]
     public IReadOnlyList<string> Tags { get; set; } = new List<string>();
@@ -53,6 +61,148 @@ public class DocumentRecord
 
     [JsonPropertyName("updated_at")]
     public string? UpdatedAt { get; set; }
+
+    /// <summary><c>image</c> or <c>audio</c> for a multimodal memory.</summary>
+    [JsonPropertyName("modality")]
+    public string? Modality { get; set; }
+
+    /// <summary>Indexed caption/transcript for a multimodal memory.</summary>
+    [JsonPropertyName("derived_text")]
+    public string? DerivedText { get; set; }
+}
+
+/// <summary>Result of storing an image or audio memory.</summary>
+public class MediaMemoryRecord
+{
+    [JsonPropertyName("doc_id")]
+    public string DocId { get; set; } = "";
+
+    [JsonPropertyName("cid")]
+    public string Cid { get; set; } = "";
+
+    [JsonPropertyName("modality")]
+    public string Modality { get; set; } = "";
+
+    [JsonPropertyName("content_type")]
+    public string ContentType { get; set; } = "";
+
+    [JsonPropertyName("derived_text")]
+    public string DerivedText { get; set; } = "";
+
+    [JsonPropertyName("derived_by")]
+    public string DerivedBy { get; set; } = "";
+
+    [JsonPropertyName("created_at")]
+    public string? CreatedAt { get; set; }
+
+    [JsonPropertyName("entity_id")]
+    public string? EntityId { get; set; }
+
+    [JsonPropertyName("partition")]
+    public string? Partition { get; set; }
+
+    [JsonPropertyName("metadata")]
+    public Dictionary<string, object?> Metadata { get; set; } = new();
+}
+
+/// <summary>Canonical tenant-scoped conversation in turn order.</summary>
+public class ConversationThread
+{
+    [JsonPropertyName("thread_id")]
+    public string ThreadId { get; set; } = "";
+
+    [JsonPropertyName("documents")]
+    public List<DocumentRecord> Documents { get; set; } = new();
+}
+
+/// <summary>Input for <see cref="AetherClient.AppendThreadAsync"/>.</summary>
+public class ThreadAppendRequest
+{
+    [JsonPropertyName("text")]
+    public string Text { get; set; } = "";
+
+    [JsonPropertyName("metadata")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public Dictionary<string, object?>? Metadata { get; set; }
+
+    [JsonPropertyName("tags")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? Tags { get; set; }
+
+    [JsonPropertyName("entity_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? EntityId { get; set; }
+
+    [JsonPropertyName("source")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Source { get; set; }
+
+    [JsonPropertyName("acl_readers")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public List<string>? AclReaders { get; set; }
+
+    [JsonPropertyName("filename")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Filename { get; set; }
+
+    /// <summary>
+    /// Stable retry key sent as the <c>Idempotency-Key</c> header, never JSON.
+    /// Omit it to let the SDK mint one per logical append/retry sequence.
+    /// </summary>
+    [JsonIgnore]
+    public string? IdempotencyKey { get; set; }
+}
+
+/// <summary>Options for <see cref="AetherClient.GetThreadAsync"/>.</summary>
+public class ThreadReadOptions
+{
+    /// <summary>Return 1-1000 newest turns; null uses the server's bounded 1000-turn cap.</summary>
+    public int? LastNTurns { get; set; }
+
+    /// <summary>Return selected turns newest-first instead of chronological order.</summary>
+    public bool RecentFirst { get; set; }
+}
+
+/// <summary>
+/// Result of a whole-thread lifecycle op
+/// (<see cref="AetherClient.ThreadRestoreAsync"/>, <see cref="AetherClient.ThreadAclAsync"/>,
+/// <see cref="AetherClient.ThreadMoveAsync"/>, <see cref="AetherClient.ThreadDeleteAsync"/>).
+/// </summary>
+public class ThreadLifecycleResult
+{
+    /// <summary>The op outcome: <c>tombstoned</c>, <c>restored</c>, <c>hard_deleted</c>, <c>acl_updated</c>, or <c>moved</c>.</summary>
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "";
+
+    /// <summary>The conversation thread the op applied to.</summary>
+    [JsonPropertyName("thread_id")]
+    public string ThreadId { get; set; } = "";
+
+    /// <summary>Number of turns whose canonical marker was rewritten by the op.</summary>
+    [JsonPropertyName("turns")]
+    public int Turns { get; set; }
+}
+
+// Wire body of PUT /threads/{id}/acl. `acl_readers` is ALWAYS present on the
+// wire — an explicit JSON null unlabels the thread (tenant-visible), [] is the
+// admin-only quarantine, and a non-empty list restricts — so it carries no
+// WhenWritingNull, mirroring insert/update ACL semantics exactly.
+internal class ThreadAclRequest
+{
+    [JsonPropertyName("acl_readers")]
+    public List<string>? AclReaders { get; set; }
+}
+
+// Wire body of POST /threads/{id}/move. Both fields are always present on the
+// wire — an explicit JSON null names the default partition — so neither carries
+// WhenWritingNull, exactly like MoveDocumentRequest.
+internal class MoveThreadRequest
+{
+    [JsonPropertyName("to_partition")]
+    public string? ToPartition { get; set; }
+
+    [JsonPropertyName("expect_partition")]
+    public string? ExpectPartition { get; set; }
 }
 
 public class SearchResult
@@ -91,6 +241,12 @@ public class SearchResult
     [JsonPropertyName("entity_id")]
     public string? EntityId { get; set; }
 
+    [JsonPropertyName("thread_id")]
+    public string? ThreadId { get; set; }
+
+    [JsonPropertyName("turn_index")]
+    public ulong? TurnIndex { get; set; }
+
     /// <summary>The matched document's tags; empty when it has none.</summary>
     [JsonPropertyName("tags")]
     public IReadOnlyList<string> Tags { get; set; } = new List<string>();
@@ -124,6 +280,10 @@ public class SearchResult
     /// hit's <see cref="DocId"/>.</summary>
     [JsonPropertyName("query_id")]
     public string? QueryId { get; set; }
+
+    /// <summary><c>image</c> or <c>audio</c> for a multimodal memory.</summary>
+    [JsonPropertyName("modality")]
+    public string? Modality { get; set; }
 }
 
 public class NodeStatus
@@ -200,6 +360,12 @@ public class RetrievalResult
     [JsonPropertyName("entity_id")]
     public string? EntityId { get; set; }
 
+    [JsonPropertyName("thread_id")]
+    public string? ThreadId { get; set; }
+
+    [JsonPropertyName("turn_index")]
+    public ulong? TurnIndex { get; set; }
+
     /// <summary>The matched document's tags; empty when it has none.</summary>
     [JsonPropertyName("tags")]
     public IReadOnlyList<string> Tags { get; set; } = new List<string>();
@@ -225,6 +391,10 @@ public class RetrievalResult
     /// null if it has never been updated since insert.</summary>
     [JsonPropertyName("updated_at")]
     public string? UpdatedAt { get; set; }
+
+    /// <summary><c>image</c> or <c>audio</c> for a multimodal memory.</summary>
+    [JsonPropertyName("modality")]
+    public string? Modality { get; set; }
 }
 
 /// <summary>A text passage with its precomputed embedding vector.</summary>
@@ -393,6 +563,11 @@ public class BatchSearchQuery
     [JsonPropertyName("entity_id")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public string? EntityId { get; set; }
+
+    /// <summary>Restrict results to one canonical conversation thread.</summary>
+    [JsonPropertyName("thread_id")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? ThreadId { get; set; }
 
     [JsonPropertyName("since")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
@@ -1190,4 +1365,509 @@ internal class LineageResponse
 
     [JsonPropertyName("records")]
     public List<AuditRecord> Records { get; set; } = new();
+}
+
+// ── Answer grounding / shareable receipts ────────────────────────────────
+//
+// These models mirror the authenticated grounding response exactly. The
+// source IDs/CIDs below are never present in the optional public share URL;
+// ShareableReceipt is aggregate-only by design.
+
+/// <summary>One tenant-private source in an answer's declared grounding set.</summary>
+public class GroundingSource
+{
+    [JsonPropertyName("document_id")]
+    public string DocumentId { get; set; } = "";
+
+    [JsonPropertyName("content_id")]
+    public string ContentId { get; set; } = "";
+
+    [JsonPropertyName("rank")]
+    public int Rank { get; set; }
+
+    [JsonPropertyName("retained_signed_event_count")]
+    public int RetainedSignedEventCount { get; set; }
+
+    [JsonPropertyName("current_content_verified")]
+    public bool CurrentContentVerified { get; set; }
+
+    /// <summary>Existing engine-verified lineage evidence for this CID. It is
+    /// not a standalone LedgerEvent signing transcript.</summary>
+    [JsonPropertyName("proof")]
+    public AuditProof? Proof { get; set; }
+}
+
+/// <summary>
+/// Source-integrity signal for a declared grounding set. A <c>verified</c>
+/// status confirms retained signed evidence only — not factual correctness or
+/// how an external model reasoned from a source.
+/// </summary>
+public class GroundingTrustSignal
+{
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "partial";
+
+    [JsonPropertyName("sources_requested")]
+    public int SourcesRequested { get; set; }
+
+    [JsonPropertyName("sources_verified")]
+    public int SourcesVerified { get; set; }
+
+    [JsonPropertyName("answer_bound")]
+    public bool AnswerBound { get; set; }
+}
+
+/// <summary>
+/// Authenticated-only verification material for the opaque public receipt
+/// commitment. <see cref="VerificationSalt"/> is never persisted or emitted
+/// from a public share link.
+/// </summary>
+public class GroundingBinding
+{
+    [JsonPropertyName("algorithm")]
+    public string Algorithm { get; set; } = "";
+
+    [JsonPropertyName("source_set_commitment")]
+    public string SourceSetCommitment { get; set; } = "";
+
+    [JsonPropertyName("source_evidence_commitment")]
+    public string SourceEvidenceCommitment { get; set; } = "";
+
+    [JsonPropertyName("binding_commitment")]
+    public string BindingCommitment { get; set; } = "";
+
+    [JsonPropertyName("verification_salt")]
+    public string VerificationSalt { get; set; } = "";
+}
+
+/// <summary>Ed25519 node attestation over the public-safe receipt payload.</summary>
+public class ReceiptAttestation
+{
+    [JsonPropertyName("signer_node_id")]
+    public string SignerNodeId { get; set; } = "";
+
+    [JsonPropertyName("signer_public_key")]
+    public string SignerPublicKey { get; set; } = "";
+
+    [JsonPropertyName("signature")]
+    public string Signature { get; set; } = "";
+
+    [JsonPropertyName("verified")]
+    public bool Verified { get; set; }
+}
+
+/// <summary>Ed25519 attestation over every authenticated grounding result.</summary>
+public class GroundingSetAttestation
+{
+    [JsonPropertyName("version")]
+    public string Version { get; set; } = "";
+
+    [JsonPropertyName("issued_at")]
+    public string IssuedAt { get; set; } = "";
+
+    [JsonPropertyName("binding_algorithm")]
+    public string BindingAlgorithm { get; set; } = "";
+
+    [JsonPropertyName("signer_node_id")]
+    public string SignerNodeId { get; set; } = "";
+
+    [JsonPropertyName("signer_public_key")]
+    public string SignerPublicKey { get; set; } = "";
+
+    [JsonPropertyName("signature")]
+    public string Signature { get; set; } = "";
+
+    [JsonPropertyName("verified")]
+    public bool Verified { get; set; }
+}
+
+/// <summary>
+/// Aggregate-only public share-link metadata. Its public URL never exposes
+/// answer text/digest, tenant identifiers, source IDs/CIDs, titles, passages,
+/// or raw ledger events.
+/// </summary>
+public class ShareableReceipt
+{
+    [JsonPropertyName("version")]
+    public string Version { get; set; } = "";
+
+    [JsonPropertyName("receipt_id")]
+    public string ReceiptId { get; set; } = "";
+
+    [JsonPropertyName("issued_at")]
+    public string IssuedAt { get; set; } = "";
+
+    [JsonPropertyName("expires_at")]
+    public string ExpiresAt { get; set; } = "";
+
+    [JsonPropertyName("source_count")]
+    public int SourceCount { get; set; }
+
+    [JsonPropertyName("verified_source_count")]
+    public int VerifiedSourceCount { get; set; }
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "partial";
+
+    [JsonPropertyName("binding_commitment")]
+    public string BindingCommitment { get; set; } = "";
+
+    [JsonPropertyName("capability_commitment")]
+    public string CapabilityCommitment { get; set; } = "";
+
+    [JsonPropertyName("owner_commitment")]
+    public string OwnerCommitment { get; set; } = "";
+
+    [JsonPropertyName("attestation")]
+    public ReceiptAttestation Attestation { get; set; } = new();
+
+    [JsonPropertyName("share_url")]
+    public string ShareUrl { get; set; } = "";
+
+    [JsonPropertyName("badge_url")]
+    public string BadgeUrl { get; set; } = "";
+}
+
+/// <summary>Authenticated answer-grounding provenance response.</summary>
+public class GroundingReceipt
+{
+    [JsonPropertyName("answer_digest")]
+    public string AnswerDigest { get; set; } = "";
+
+    [JsonPropertyName("sources")]
+    public IReadOnlyList<GroundingSource> Sources { get; set; } = new List<GroundingSource>();
+
+    [JsonPropertyName("trust")]
+    public GroundingTrustSignal Trust { get; set; } = new();
+
+    [JsonPropertyName("binding")]
+    public GroundingBinding Binding { get; set; } = new();
+
+    [JsonPropertyName("attestation")]
+    public GroundingSetAttestation Attestation { get; set; } = new();
+
+    [JsonPropertyName("receipt")]
+    public ShareableReceipt? Receipt { get; set; }
+}
+
+internal class GroundingReceiptRequest
+{
+    [JsonPropertyName("answer")]
+    public string Answer { get; set; } = "";
+
+    [JsonPropertyName("source_doc_ids")]
+    public IReadOnlyList<string> SourceDocIds { get; set; } = new List<string>();
+
+    [JsonPropertyName("partition")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? Partition { get; set; }
+
+    [JsonPropertyName("share")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingDefault)]
+    public bool Share { get; set; }
+}
+
+// ── Connections + connect sessions ──────
+
+/// <summary>Result of <see cref="AetherClient.CreateConnectSessionAsync"/>.</summary>
+public class ConnectSession
+{
+    /// <summary>Opaque, single-use. Embedded in <see cref="ConnectUrl"/>.</summary>
+    [JsonPropertyName("session_token")]
+    public string SessionToken { get; set; } = "";
+
+    /// <summary>Open this in the end user's browser to start the hosted OAuth flow.</summary>
+    [JsonPropertyName("connect_url")]
+    public string ConnectUrl { get; set; } = "";
+
+    /// <summary>Returned exactly once. Store it server-side; use it with
+    /// <see cref="AetherConnections.VerifyRedirectSignature"/> when the flow completes.</summary>
+    [JsonPropertyName("client_secret")]
+    public string ClientSecret { get; set; } = "";
+
+    [JsonPropertyName("expires_at")]
+    public string ExpiresAt { get; set; } = "";
+}
+
+internal class CreateConnectSessionRequest
+{
+    [JsonPropertyName("provider")]
+    public string Provider { get; set; } = "dropbox";
+
+    [JsonPropertyName("external_user_id")]
+    public string ExternalUserId { get; set; } = "";
+
+    [JsonPropertyName("return_url")]
+    public string ReturnUrl { get; set; } = "";
+
+    [JsonPropertyName("target_partition")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public string? TargetPartition { get; set; }
+}
+
+/// <summary>Filters for <see cref="AetherClient.ListConnectionsAsync"/>.</summary>
+public class ListConnectionsOptions
+{
+    /// <summary>Narrow to <c>"tenant"</c> or <c>"external_user"</c>.</summary>
+    public string? OwnerType { get; set; }
+
+    /// <summary>Narrow to one end user's connections; implies
+    /// <c>OwnerType == "external_user"</c> when <see cref="OwnerType"/> is null.</summary>
+    public string? OwnerId { get; set; }
+
+    /// <summary>Defaults to <c>true</c> — keep disconnected connections as audit rows.</summary>
+    public bool IncludePurged { get; set; } = true;
+}
+
+/// <summary>One connection — a developer's own source (mode A) or one end
+/// user's (mode B). Never carries credential material.</summary>
+public class Connection
+{
+    [JsonPropertyName("connection_id")]
+    public string ConnectionId { get; set; } = "";
+
+    [JsonPropertyName("provider")]
+    public string Provider { get; set; } = "";
+
+    [JsonPropertyName("owner_type")]
+    public string OwnerType { get; set; } = "";
+
+    [JsonPropertyName("owner_id")]
+    public string? OwnerId { get; set; }
+
+    [JsonPropertyName("provider_account_id")]
+    public string ProviderAccountId { get; set; } = "";
+
+    [JsonPropertyName("account_display_name")]
+    public string? AccountDisplayName { get; set; }
+
+    /// <summary>Null for mode A (the tenant's default partition); the end
+    /// user's id for mode B.</summary>
+    [JsonPropertyName("target_partition")]
+    public string? TargetPartition { get; set; }
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "";
+
+    [JsonPropertyName("granted_scopes")]
+    public IReadOnlyList<string> GrantedScopes { get; set; } = new List<string>();
+
+    [JsonPropertyName("created_at")]
+    public string CreatedAt { get; set; } = "";
+
+    [JsonPropertyName("last_sync_at")]
+    public string? LastSyncAt { get; set; }
+
+    [JsonPropertyName("last_error")]
+    public string? LastError { get; set; }
+
+    [JsonPropertyName("files_synced")]
+    public long FilesSynced { get; set; }
+
+    [JsonPropertyName("files_skipped")]
+    public long FilesSkipped { get; set; }
+
+    [JsonPropertyName("files_deleted")]
+    public long FilesDeleted { get; set; }
+
+    [JsonPropertyName("selected_paths")]
+    public IReadOnlyList<string> SelectedPaths { get; set; } = new List<string>();
+
+    /// <summary><c>"not_started"</c>, <c>"in_flight"</c>, or <c>"complete"</c>.</summary>
+    [JsonPropertyName("purge_state")]
+    public string PurgeState { get; set; } = "";
+
+    [JsonPropertyName("purge_receipt_id")]
+    public string? PurgeReceiptId { get; set; }
+
+    [JsonPropertyName("credential_deleted")]
+    public bool CredentialDeleted { get; set; }
+
+    /// <summary>
+    /// True when this row's provider-side identity was withheld because the
+    /// call was not scoped to the connection's partition: <see
+    /// cref="ProviderAccountId"/> is then "" and <see
+    /// cref="AccountDisplayName"/> null. Every other field is real. Pass the
+    /// partition — the same scope the by-id routes require — to get the
+    /// identity. Always false for mode-A connections and on by-id reads.
+    /// </summary>
+    [JsonPropertyName("identity_redacted")]
+    public bool IdentityRedacted { get; set; }
+}
+
+/// <summary>Summary of what a disconnect destroyed.</summary>
+public class PurgeSummary
+{
+    [JsonPropertyName("receipt_id")]
+    public string ReceiptId { get; set; } = "";
+
+    [JsonPropertyName("documents_purged")]
+    public long DocumentsPurged { get; set; }
+
+    [JsonPropertyName("merkle_root")]
+    public string MerkleRoot { get; set; } = "";
+
+    [JsonPropertyName("completed_at")]
+    public string CompletedAt { get; set; } = "";
+
+    [JsonPropertyName("signer_node_id")]
+    public string SignerNodeId { get; set; } = "";
+}
+
+/// <summary>Result of <see cref="AetherClient.DeleteConnectionAsync"/>.</summary>
+public class DisconnectResult
+{
+    [JsonPropertyName("connection_id")]
+    public string ConnectionId { get; set; } = "";
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "";
+
+    /// <summary>Null only when the connection did not exist (the idempotent
+    /// no-op) — a disconnect that ran always produces a receipt.</summary>
+    [JsonPropertyName("purge")]
+    public PurgeSummary? Purge { get; set; }
+}
+
+/// <summary>The full signed proof returned by
+/// <see cref="AetherClient.GetPurgeReceiptAsync"/>.</summary>
+public class ConnectionPurgeReceipt
+{
+    [JsonPropertyName("version")]
+    public string Version { get; set; } = "";
+
+    [JsonPropertyName("receipt_id")]
+    public string ReceiptId { get; set; } = "";
+
+    [JsonPropertyName("tenant_id")]
+    public string TenantId { get; set; } = "";
+
+    [JsonPropertyName("connection_id")]
+    public string ConnectionId { get; set; } = "";
+
+    [JsonPropertyName("provider")]
+    public string Provider { get; set; } = "";
+
+    [JsonPropertyName("owner")]
+    public string Owner { get; set; } = "";
+
+    [JsonPropertyName("provider_account_id")]
+    public string ProviderAccountId { get; set; } = "";
+
+    [JsonPropertyName("documents_purged")]
+    public long DocumentsPurged { get; set; }
+
+    [JsonPropertyName("documents_failed")]
+    public long DocumentsFailed { get; set; }
+
+    [JsonPropertyName("merkle_root")]
+    public string MerkleRoot { get; set; } = "";
+
+    [JsonPropertyName("merkle_leaf_count")]
+    public long MerkleLeafCount { get; set; }
+
+    [JsonPropertyName("purged_document_ids")]
+    public IReadOnlyList<string> PurgedDocumentIds { get; set; } = new List<string>();
+
+    [JsonPropertyName("partitions_touched")]
+    public IReadOnlyList<string> PartitionsTouched { get; set; } = new List<string>();
+
+    [JsonPropertyName("default_partition_touched")]
+    public bool DefaultPartitionTouched { get; set; }
+
+    [JsonPropertyName("credential_revocation")]
+    public string CredentialRevocation { get; set; } = "";
+
+    [JsonPropertyName("credential_deleted")]
+    public bool CredentialDeleted { get; set; }
+
+    [JsonPropertyName("started_at")]
+    public string StartedAt { get; set; } = "";
+
+    [JsonPropertyName("completed_at")]
+    public string CompletedAt { get; set; } = "";
+
+    [JsonPropertyName("signer_node_id")]
+    public string SignerNodeId { get; set; } = "";
+
+    [JsonPropertyName("signer_public_key")]
+    public string SignerPublicKey { get; set; } = "";
+
+    [JsonPropertyName("signature")]
+    public string Signature { get; set; } = "";
+
+    /// <summary>The node's own re-verification of the row at read time.</summary>
+    [JsonPropertyName("verified")]
+    public bool Verified { get; set; }
+}
+
+/// <summary>One entry in a <see cref="AetherClient.BrowseConnectionAsync"/> page.</summary>
+public class ConnectionBrowseEntry
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("path_display")]
+    public string PathDisplay { get; set; } = "";
+
+    [JsonPropertyName("is_folder")]
+    public bool IsFolder { get; set; }
+
+    [JsonPropertyName("size_bytes")]
+    public long? SizeBytes { get; set; }
+
+    [JsonPropertyName("modified")]
+    public string? Modified { get; set; }
+}
+
+/// <summary>One page of <see cref="AetherClient.BrowseConnectionAsync"/>.</summary>
+public class ConnectionBrowsePage
+{
+    [JsonPropertyName("entries")]
+    public IReadOnlyList<ConnectionBrowseEntry> Entries { get; set; } = new List<ConnectionBrowseEntry>();
+
+    /// <summary>Present iff another page exists; pass back as the next call's cursor.</summary>
+    [JsonPropertyName("next_cursor")]
+    public string? NextCursor { get; set; }
+}
+
+internal class ConnectionListResponse
+{
+    [JsonPropertyName("connections")]
+    public List<Connection> Connections { get; set; } = new();
+}
+
+// Slim wire shape of POST /connections/{id}/resync; AetherClient re-fetches
+// the full record so callers get one consistent shape everywhere.
+internal class ResyncResponse
+{
+    [JsonPropertyName("connection_id")]
+    public string ConnectionId { get; set; } = "";
+
+    [JsonPropertyName("status")]
+    public string Status { get; set; } = "";
+}
+
+internal class BrowseConnectionRequest
+{
+    [JsonPropertyName("path")]
+    public string Path { get; set; } = "";
+
+    [JsonPropertyName("cursor")]
+    public string? Cursor { get; set; }
+}
+
+internal class UpdateSelectionRequest
+{
+    [JsonPropertyName("selected_paths")]
+    public IReadOnlyList<string> SelectedPaths { get; set; } = new List<string>();
+}
+
+internal class SelectionResponse
+{
+    [JsonPropertyName("connection_id")]
+    public string ConnectionId { get; set; } = "";
+
+    [JsonPropertyName("selected_paths")]
+    public IReadOnlyList<string> SelectedPaths { get; set; } = new List<string>();
 }
