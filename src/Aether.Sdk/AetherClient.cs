@@ -27,7 +27,7 @@ public partial class AetherClient : IDisposable
     private bool _disposed;
 
     /// <summary>SDK version, reported in the User-Agent header. Keep in sync with the csproj &lt;Version&gt;.</summary>
-    private const string Version = "0.6.0";
+    private const string Version = "0.7.0";
 
     private static readonly HashSet<HttpStatusCode> RetryableStatusCodes = new()
     {
@@ -101,7 +101,8 @@ public partial class AetherClient : IDisposable
         string? entityId = null,
         string? source = null,
         IReadOnlyDictionary<string, object?>? metadata = null,
-        bool extractFacts = false)
+        bool extractFacts = false,
+        bool? summarize = null)
     {
         var qs = baseQuery;
         if (tags is { Count: > 0 })
@@ -118,6 +119,9 @@ public partial class AetherClient : IDisposable
             qs += $"&metadata={Uri.EscapeDataString(JsonSerializer.Serialize(metadata, JsonOptions))}";
         if (extractFacts)
             qs += "&extract_facts=true";
+        // Tri-state: an explicit true/false is sent; null leaves the tenant default.
+        if (summarize.HasValue)
+            qs += summarize.Value ? "&summarize=true" : "&summarize=false";
         return qs;
     }
 
@@ -240,7 +244,7 @@ public partial class AetherClient : IDisposable
     /// Creates a new Aether client with an externally managed HttpClient.
     /// Useful for testing and dependency injection.
     /// </summary>
-    internal AetherClient(HttpClient httpClient, string baseUrl)
+    internal AetherClient(HttpClient httpClient, string baseUrl, TimeSpan? retryBaseDelay = null)
     {
         _http = httpClient;
         // An externally supplied HttpClient is owned by the caller: Dispose() must
@@ -248,7 +252,7 @@ public partial class AetherClient : IDisposable
         _ownsHttpClient = false;
         _baseUrl = baseUrl.TrimEnd('/');
         _maxRetries = 2;
-        _retryBaseDelay = TimeSpan.FromSeconds(0.5);
+        _retryBaseDelay = retryBaseDelay ?? TimeSpan.FromSeconds(0.5);
         ConfigureUserAgent(_http);
     }
 
@@ -505,6 +509,39 @@ public partial class AetherClient : IDisposable
         return bare == "/status" ? path : ApiVersionPrefix + path;
     }
 
+    /// <summary>
+    /// Build the typed API exception for a non-2xx response. Every request path
+    /// funnels its errors through here, so the <c>(status, code)</c> factory —
+    /// including a version conflict's <c>current_version</c> — applies uniformly.
+    /// </summary>
+    private static async Task<AetherApiException> BuildApiExceptionAsync(
+        HttpResponseMessage response,
+        CancellationToken cancellationToken)
+    {
+        var body = await response.Content.ReadAsStringAsync(
+#if NET8_0_OR_GREATER
+            cancellationToken
+#endif
+        ).ConfigureAwait(false);
+
+        string errorMessage;
+        string? errorCode = null;
+        int? currentVersion = null;
+        try
+        {
+            var errorObj = JsonSerializer.Deserialize<ErrorResponse>(body, JsonOptions);
+            errorMessage = errorObj?.Error ?? response.ReasonPhrase ?? "Unknown error";
+            errorCode = errorObj?.Code;
+            currentVersion = errorObj?.CurrentVersionValue;
+        }
+        catch
+        {
+            errorMessage = response.ReasonPhrase ?? "Unknown error";
+        }
+
+        return AetherApiException.FromResponse(response.StatusCode, errorMessage, errorCode, currentVersion);
+    }
+
     private async Task<T> RequestAsync<T>(
         string path,
         HttpMethod method,
@@ -512,6 +549,24 @@ public partial class AetherClient : IDisposable
         CancellationToken cancellationToken = default,
         string? idempotencyKey = null,
         bool retry = true)
+    {
+        var (value, _) = await RequestWithHeadersAsync<T>(
+            path, method, content, cancellationToken, idempotencyKey, retry, headers: null).ConfigureAwait(false);
+        return value;
+    }
+
+    /// <summary>
+    /// <see cref="RequestAsync{T}"/> plus extra request headers (sent unchanged on
+    /// every retry) and the response <c>ETag</c>, for conditional requests.
+    /// </summary>
+    private async Task<(T Value, string? ETag)> RequestWithHeadersAsync<T>(
+        string path,
+        HttpMethod method,
+        HttpContent? content,
+        CancellationToken cancellationToken,
+        string? idempotencyKey,
+        bool retry,
+        IReadOnlyList<KeyValuePair<string, string>>? headers)
     {
         // Data routes are rewritten under the /v1 API version prefix here, at the
         // transport boundary, so every caller (including the Memory facade)
@@ -561,6 +616,11 @@ public partial class AetherClient : IDisposable
                 }
                 if (idempotencyKey != null)
                     msg.Headers.Add("Idempotency-Key", idempotencyKey);
+                if (headers != null)
+                {
+                    foreach (var header in headers)
+                        msg.Headers.TryAddWithoutValidation(header.Key, header.Value);
+                }
                 return msg;
             }, cancellationToken, retry).ConfigureAwait(false);
         }
@@ -576,28 +636,9 @@ public partial class AetherClient : IDisposable
         }
 
         if (!response.IsSuccessStatusCode)
-        {
-            var body = await response.Content.ReadAsStringAsync(
-#if NET8_0_OR_GREATER
-                cancellationToken
-#endif
-            ).ConfigureAwait(false);
+            throw await BuildApiExceptionAsync(response, cancellationToken).ConfigureAwait(false);
 
-            string errorMessage;
-            string? errorCode = null;
-            try
-            {
-                var errorObj = JsonSerializer.Deserialize<ErrorResponse>(body, JsonOptions);
-                errorMessage = errorObj?.Error ?? response.ReasonPhrase ?? "Unknown error";
-                errorCode = errorObj?.Code;
-            }
-            catch
-            {
-                errorMessage = response.ReasonPhrase ?? "Unknown error";
-            }
-
-            throw AetherApiException.FromResponse(response.StatusCode, errorMessage, errorCode);
-        }
+        var etag = response.Headers.TryGetValues("ETag", out var etags) ? etags.FirstOrDefault() : null;
 
         var json = await response.Content.ReadAsStringAsync(
 #if NET8_0_OR_GREATER
@@ -605,8 +646,9 @@ public partial class AetherClient : IDisposable
 #endif
         ).ConfigureAwait(false);
 
-        return JsonSerializer.Deserialize<T>(json, JsonOptions)
+        var value = JsonSerializer.Deserialize<T>(json, JsonOptions)
             ?? throw new AetherException($"Failed to deserialize response from {path}");
+        return (value, etag);
     }
 
     private async Task RequestVoidAsync(
@@ -643,28 +685,7 @@ public partial class AetherClient : IDisposable
         }
 
         if (!response.IsSuccessStatusCode)
-        {
-            var body = await response.Content.ReadAsStringAsync(
-#if NET8_0_OR_GREATER
-                cancellationToken
-#endif
-            ).ConfigureAwait(false);
-
-            string errorMessage;
-            string? errorCode = null;
-            try
-            {
-                var errorObj = JsonSerializer.Deserialize<ErrorResponse>(body, JsonOptions);
-                errorMessage = errorObj?.Error ?? response.ReasonPhrase ?? "Unknown error";
-                errorCode = errorObj?.Code;
-            }
-            catch
-            {
-                errorMessage = response.ReasonPhrase ?? "Unknown error";
-            }
-
-            throw AetherApiException.FromResponse(response.StatusCode, errorMessage, errorCode);
-        }
+            throw await BuildApiExceptionAsync(response, cancellationToken).ConfigureAwait(false);
     }
 
     private async Task<byte[]> RequestRawAsync(
@@ -692,28 +713,7 @@ public partial class AetherClient : IDisposable
         }
 
         if (!response.IsSuccessStatusCode)
-        {
-            var body = await response.Content.ReadAsStringAsync(
-#if NET8_0_OR_GREATER
-                cancellationToken
-#endif
-            ).ConfigureAwait(false);
-
-            string errorMessage;
-            string? errorCode = null;
-            try
-            {
-                var errorObj = JsonSerializer.Deserialize<ErrorResponse>(body, JsonOptions);
-                errorMessage = errorObj?.Error ?? response.ReasonPhrase ?? "Unknown error";
-                errorCode = errorObj?.Code;
-            }
-            catch
-            {
-                errorMessage = response.ReasonPhrase ?? "Unknown error";
-            }
-
-            throw AetherApiException.FromResponse(response.StatusCode, errorMessage, errorCode);
-        }
+            throw await BuildApiExceptionAsync(response, cancellationToken).ConfigureAwait(false);
 
         return await response.Content.ReadAsByteArrayAsync(
 #if NET8_0_OR_GREATER
@@ -728,6 +728,7 @@ public partial class AetherClient : IDisposable
     /// If <paramref name="contentType"/> is null the type is guessed from the filename extension.</summary>
     /// <param name="entityId">Optional entity ID to associate with the document, for entity-scoped search and list filters.</param>
     /// <param name="source">Optional source label to associate with the document (e.g. its origin system), for source-scoped search and list filters.</param>
+    /// <param name="summarize">Whether to generate a summary of the document in the background after it is stored (read it with <see cref="GetSummaryAsync"/>). <c>true</c> or <c>false</c> is sent explicitly; <c>null</c> (default) applies the tenant's default. Never fails or delays the insert; <see cref="DocumentRecord.Summary"/> reports <c>"pending"</c> or <c>"skipped"</c>.</param>
     public async Task<DocumentRecord> InsertAsync(
         byte[] data,
         string filename,
@@ -738,6 +739,7 @@ public partial class AetherClient : IDisposable
         string? source = null,
         IReadOnlyDictionary<string, object?>? metadata = null,
         bool extractFacts = false,
+        bool? summarize = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(filename))
@@ -749,7 +751,7 @@ public partial class AetherClient : IDisposable
         contentType ??= GuessContentType(filename);
         var query = AppendPartition(BuildQueryString(
             $"filename={Uri.EscapeDataString(filename)}&content_type={Uri.EscapeDataString(contentType)}",
-            tags, chunking, entityId, source, metadata, extractFacts));
+            tags, chunking, entityId, source, metadata, extractFacts, summarize));
         var content = new ByteArrayContent(data);
         return await RequestAsync<DocumentRecord>(
             $"/documents?{query}", HttpMethod.Post, content, cancellationToken).ConfigureAwait(false);
@@ -759,6 +761,7 @@ public partial class AetherClient : IDisposable
     /// <param name="entityId">Optional entity ID to associate with the document, for entity-scoped search and list filters.</param>
     /// <param name="source">Optional source label to associate with the document (e.g. its origin system), for source-scoped search and list filters.</param>
     /// <param name="extractFacts">When true, distill the text into atomic facts server-side, each stored as a sibling document tagged <c>kind:fact</c> and linked to this document. Requires fact extraction to be configured on the node.</param>
+    /// <param name="summarize">Whether to generate a summary in the background after the insert; <c>null</c> (default) applies the tenant's default. See <see cref="InsertAsync"/>.</param>
     public async Task<DocumentRecord> InsertTextAsync(
         string text,
         string filename = "text.txt",
@@ -768,12 +771,13 @@ public partial class AetherClient : IDisposable
         string? source = null,
         IReadOnlyDictionary<string, object?>? metadata = null,
         bool extractFacts = false,
+        bool? summarize = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(text))
             throw new ArgumentException("text cannot be empty", nameof(text));
         var bytes = Encoding.UTF8.GetBytes(text);
-        return await InsertAsync(bytes, filename, "text/plain", tags, chunking, entityId, source, metadata, extractFacts, cancellationToken).ConfigureAwait(false);
+        return await InsertAsync(bytes, filename, "text/plain", tags, chunking, entityId, source, metadata, extractFacts, summarize, cancellationToken).ConfigureAwait(false);
     }
 
     /// <summary>
@@ -838,6 +842,7 @@ public partial class AetherClient : IDisposable
     /// <param name="tags">Optional tags to associate with the document.</param>
     /// <param name="entityId">Optional entity ID to associate with the document, for entity-scoped search and list filters.</param>
     /// <param name="source">Optional source label to associate with the document (e.g. its origin system), for source-scoped search and list filters.</param>
+    /// <param name="summarize">Whether to generate a summary in the background after the insert; <c>null</c> (default) applies the tenant's default. See <see cref="InsertAsync"/>.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     public async Task<DocumentRecord> InsertStreamAsync(
         Stream stream,
@@ -847,12 +852,13 @@ public partial class AetherClient : IDisposable
         string? entityId = null,
         string? source = null,
         IReadOnlyDictionary<string, object?>? metadata = null,
+        bool? summarize = null,
         CancellationToken cancellationToken = default)
     {
         contentType ??= "application/octet-stream";
         var query = AppendPartition(BuildQueryString(
             $"filename={Uri.EscapeDataString(filename)}&content_type={Uri.EscapeDataString(contentType)}",
-            tags, entityId: entityId, source: source, metadata: metadata));
+            tags, entityId: entityId, source: source, metadata: metadata, summarize: summarize));
         var url = $"{_baseUrl}{VersionedPath("/documents")}?{query}";
 
         HttpResponseMessage response;
@@ -877,28 +883,7 @@ public partial class AetherClient : IDisposable
         }
 
         if (!response.IsSuccessStatusCode)
-        {
-            var body = await response.Content.ReadAsStringAsync(
-#if NET8_0_OR_GREATER
-                cancellationToken
-#endif
-            ).ConfigureAwait(false);
-
-            string errorMessage;
-            string? errorCode = null;
-            try
-            {
-                var errorObj = JsonSerializer.Deserialize<ErrorResponse>(body, JsonOptions);
-                errorMessage = errorObj?.Error ?? response.ReasonPhrase ?? "Unknown error";
-                errorCode = errorObj?.Code;
-            }
-            catch
-            {
-                errorMessage = response.ReasonPhrase ?? "Unknown error";
-            }
-
-            throw AetherApiException.FromResponse(response.StatusCode, errorMessage, errorCode);
-        }
+            throw await BuildApiExceptionAsync(response, cancellationToken).ConfigureAwait(false);
 
         var json = await response.Content.ReadAsStringAsync(
 #if NET8_0_OR_GREATER
@@ -1249,6 +1234,208 @@ public partial class AetherClient : IDisposable
         return await RequestRawAsync(
             AppendPartitionGuard($"/documents/{Uri.EscapeDataString(docId)}/download"),
             cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>Largest page <see cref="GetTextAsync"/> can return (1 MiB).</summary>
+    internal const int MaxTextPageBytes = 1_048_576;
+
+    /// <summary>
+    /// Read a document's text: the original for text documents, the caption or
+    /// transcript for media, and text rebuilt from the parsed passages for PDF,
+    /// Office and other parsed types.
+    /// </summary>
+    /// <remarks>
+    /// The result is paged: pass <see cref="DocumentText.NextOffset"/> back as
+    /// <paramref name="offset"/> while <see cref="DocumentText.Truncated"/>.
+    /// A document with no readable text comes back with <c>State == "unsupported"</c>.
+    /// On a partition handle the partition is sent as a guard: a document in a
+    /// different partition returns the same 404 as a nonexistent one.
+    /// </remarks>
+    /// <param name="docId">ID of the document.</param>
+    /// <param name="section">A heading's text (case- and whitespace-insensitive) or its exact slug.</param>
+    /// <param name="outline">Return only the outline (<see cref="DocumentText.Sections"/>), with empty text.</param>
+    /// <param name="offset">Byte offset to start from — a previous page's <see cref="DocumentText.NextOffset"/>.</param>
+    /// <param name="maxBytes">Page budget in bytes, 1–1048576 (server default 65536).</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="AetherApiException">404 (not found, or no matching section), 409 (ambiguous section), 400 (invalid options).</exception>
+    public async Task<DocumentText> GetTextAsync(
+        string docId,
+        string? section = null,
+        bool outline = false,
+        int? offset = null,
+        int? maxBytes = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(docId))
+            throw new ArgumentException("docId cannot be empty", nameof(docId));
+        var query = new List<string>();
+        if (section != null)
+            query.Add($"section={Uri.EscapeDataString(section)}");
+        if (outline)
+            query.Add("outline=true");
+        if (offset.HasValue)
+            query.Add($"offset={offset.Value.ToString(CultureInfo.InvariantCulture)}");
+        if (maxBytes.HasValue)
+            query.Add($"max_bytes={maxBytes.Value.ToString(CultureInfo.InvariantCulture)}");
+        var path = $"/documents/{Uri.EscapeDataString(docId)}/text";
+        if (query.Count > 0)
+            path += "?" + string.Join("&", query);
+        return await RequestAsync<DocumentText>(
+            AppendPartitionGuard(path), HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    // ── Document summaries ────────────────────────────────────────────
+
+    /// <summary>
+    /// Read a document's summary. Always succeeds for a visible document:
+    /// <see cref="DocumentSummary.State"/> says whether one is <c>ready</c>,
+    /// <c>pending</c>, <c>failed</c>, <c>skipped</c>, <c>unsupported</c>, or
+    /// <c>none</c>.
+    /// </summary>
+    /// <remarks>
+    /// <see cref="DocumentSummary.Content"/> shows the stored summary whatever the
+    /// state (it stays visible while a regeneration is pending), and
+    /// <see cref="DocumentSummary.Stale"/> is true when the document changed after
+    /// the summary was written. On a partition handle the partition is sent as a
+    /// guard: a document in a different partition returns the same 404 as a
+    /// nonexistent one. A 404 <c>feature_not_enabled</c> means summaries aren't
+    /// enabled on your deployment.
+    /// </remarks>
+    /// <param name="docId">ID of the summarized document.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="ArgumentException"><paramref name="docId"/> is empty.</exception>
+    /// <exception cref="AetherApiException">404 (document not visible, or the feature is off).</exception>
+    public async Task<DocumentSummary> GetSummaryAsync(
+        string docId,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(docId))
+            throw new ArgumentException("docId cannot be empty", nameof(docId));
+        return await RequestAsync<DocumentSummary>(
+            AppendPartitionGuard($"/documents/{Uri.EscapeDataString(docId)}/summary"),
+            HttpMethod.Get, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Write your own summary for a document (1–16,384 bytes of markdown),
+    /// replacing any stored one. The result is <c>ready</c> and user-authored; a
+    /// regeneration replaces it only when forced.
+    /// </summary>
+    /// <param name="docId">ID of the summarized document.</param>
+    /// <param name="content">The summary markdown.</param>
+    /// <param name="expectedRevision">
+    /// Optional precondition: the <see cref="DocumentSummary.Revision"/> you last
+    /// read. The write fails with a 412 <c>summary_revision_conflict</c>
+    /// <see cref="AetherApiException"/> when the stored summary has changed since
+    /// (or none is stored).
+    /// </param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="ArgumentException"><paramref name="docId"/> or a given <paramref name="expectedRevision"/> is empty.</exception>
+    public async Task<DocumentSummary> PutSummaryAsync(
+        string docId,
+        string content,
+        string? expectedRevision = null,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(docId))
+            throw new ArgumentException("docId cannot be empty", nameof(docId));
+        if (content is null)
+            throw new ArgumentNullException(nameof(content));
+        if (expectedRevision != null && expectedRevision.Length == 0)
+            throw new ArgumentException("expectedRevision cannot be empty", nameof(expectedRevision));
+        var headers = expectedRevision == null
+            ? null
+            : new[] { new KeyValuePair<string, string>("If-Match", $"\"{expectedRevision}\"") };
+        var json = JsonSerializer.Serialize(new Dictionary<string, object?> { ["content"] = content }, JsonOptions);
+        using var body = new StringContent(json, Encoding.UTF8, "application/json");
+        var (summary, _) = await RequestWithHeadersAsync<DocumentSummary>(
+            AppendPartitionGuard($"/documents/{Uri.EscapeDataString(docId)}/summary"),
+            HttpMethod.Put, body, cancellationToken, idempotencyKey: null, retry: true, headers).ConfigureAwait(false);
+        return summary;
+    }
+
+    /// <summary>
+    /// Queue a fresh server-generated summary for a document (HTTP 202). The
+    /// result reads <c>pending</c>; poll <see cref="GetSummaryAsync"/> for the
+    /// outcome. Joins a generation that is already pending.
+    /// </summary>
+    /// <param name="docId">ID of the summarized document.</param>
+    /// <param name="force">Also replace a user-authored summary. Without it, a
+    /// user-authored summary makes the call fail with a 409
+    /// <c>summary_user_authored</c> <see cref="AetherApiException"/>.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
+    /// <exception cref="ArgumentException"><paramref name="docId"/> is empty.</exception>
+    /// <exception cref="AetherApiException">409 (user-authored summary), 422 (no summarizer configured, or the document can't be summarized), 404.</exception>
+    public async Task<DocumentSummary> RegenerateSummaryAsync(
+        string docId,
+        bool force = false,
+        CancellationToken cancellationToken = default)
+    {
+        if (string.IsNullOrEmpty(docId))
+            throw new ArgumentException("docId cannot be empty", nameof(docId));
+        var path = $"/documents/{Uri.EscapeDataString(docId)}/summary";
+        if (force)
+            path += "?force=true";
+        return await RequestAsync<DocumentSummary>(
+            AppendPartitionGuard(path), HttpMethod.Post, cancellationToken: cancellationToken).ConfigureAwait(false);
+    }
+
+    /// <summary>
+    /// Whether a document of this content type can be read by decoding its
+    /// original bytes as UTF-8: <c>text/*</c> except HTML, CSV, TSV and RTF (the
+    /// server parses those), plus a few structured application types. Everything
+    /// else — PDF, Office, octet-stream, a missing type — is read through
+    /// <see cref="GetTextAsync"/>.
+    /// </summary>
+    internal static bool IsTextLikeContentType(string? contentType)
+    {
+        var raw = contentType ?? "";
+        var semicolon = raw.IndexOf(';');
+        var baseType = (semicolon < 0 ? raw : raw.Substring(0, semicolon)).Trim().ToLowerInvariant();
+        if (baseType.StartsWith("text/", StringComparison.Ordinal))
+        {
+            return baseType != "text/html"
+                && baseType != "text/csv"
+                && baseType != "text/tab-separated-values"
+                && baseType != "text/rtf";
+        }
+        return baseType == "application/json"
+            || baseType == "application/xml"
+            || baseType == "application/javascript"
+            || baseType == "application/typescript"
+            || baseType == "application/x-yaml";
+    }
+
+    /// <summary>
+    /// Read a non-media document's text for <c>RetrieveAsync</c>,
+    /// <c>Memory.RecallAsync</c> and <c>Memory.ListAsync</c>: text-like types are
+    /// downloaded, anything else goes through <see cref="GetTextAsync"/> (up to
+    /// 1 MiB). When that text is unavailable (<c>unsupported</c>) or the server
+    /// answers 404 (an older server, or the document vanished),
+    /// <paramref name="fallback"/> is returned. Other errors propagate.
+    /// </summary>
+    internal async Task<string> HydrateDocumentTextAsync(
+        string docId,
+        string? contentType,
+        string fallback,
+        CancellationToken cancellationToken)
+    {
+        if (IsTextLikeContentType(contentType))
+        {
+            var bytes = await DownloadAsync(docId, cancellationToken).ConfigureAwait(false);
+            return Encoding.UTF8.GetString(bytes);
+        }
+        DocumentText text;
+        try
+        {
+            text = await GetTextAsync(docId, maxBytes: MaxTextPageBytes, cancellationToken: cancellationToken)
+                .ConfigureAwait(false);
+        }
+        catch (AetherApiException ex) when (ex.StatusCode == HttpStatusCode.NotFound)
+        {
+            return fallback;
+        }
+        return text.State == "ready" ? text.Text : fallback;
     }
 
     /// <summary>List active documents with pagination.</summary>
@@ -1687,9 +1874,11 @@ public partial class AetherClient : IDisposable
     }
 
     /// <summary>Search with content retrieval. Results are deduplicated by DocId
-    /// (highest-scoring match wins). Text falls back to <see cref="DownloadAsync"/>
-    /// while media falls back to metadata <c>DerivedText</c>; original media is
-    /// never decoded as UTF-8.</summary>
+    /// (highest-scoring match wins). Text-like documents are downloaded; other
+    /// types (PDF, Office, HTML, CSV, …) are read through <see cref="GetTextAsync"/>,
+    /// falling back to the matched passage on a 404 or an <c>unsupported</c> state;
+    /// media uses its caption/transcript passage or metadata <c>DerivedText</c>.
+    /// No original binary is ever decoded as UTF-8.</summary>
     /// <param name="query">Natural language search query.</param>
     /// <param name="k">Maximum number of results to return. Default: 5.</param>
     /// <param name="tags">Optional tags to filter results.</param>
@@ -1766,8 +1955,11 @@ public partial class AetherClient : IDisposable
                 }
                 else
                 {
-                    var bytes = await DownloadAsync(r.DocId, cancellationToken).ConfigureAwait(false);
-                    content = Encoding.UTF8.GetString(bytes);
+                    // Never decode a binary original: text-like types are
+                    // downloaded, anything else (PDF, Office, …) is read through
+                    // GetTextAsync, falling back to the matched passage.
+                    content = await HydrateDocumentTextAsync(
+                        r.DocId, r.ContentType, r.Passage ?? "", cancellationToken).ConfigureAwait(false);
                 }
             }
 
@@ -1789,6 +1981,7 @@ public partial class AetherClient : IDisposable
                 CreatedAt = r.CreatedAt,
                 UpdatedAt = r.UpdatedAt,
                 Modality = r.Modality,
+                MemoryFile = r.MemoryFile,
             });
         }
 
@@ -2200,6 +2393,7 @@ public partial class AetherClient : IDisposable
     /// <summary>Enqueue a document for asynchronous processing. Useful for large documents.</summary>
     /// <param name="entityId">Optional entity ID to associate with the document, for entity-scoped search and list filters.</param>
     /// <param name="source">Optional source label to associate with the document (e.g. its origin system), for source-scoped search and list filters.</param>
+    /// <param name="summarize">Whether to generate a summary in the background once the job completes; <c>null</c> (default) applies the tenant's default. The finished job reports <see cref="JobStatus.SummaryState"/>.</param>
     public async Task<AsyncJobResult> EnqueueDocumentAsync(
         byte[] data,
         string filename,
@@ -2209,6 +2403,7 @@ public partial class AetherClient : IDisposable
         string? entityId = null,
         string? source = null,
         IReadOnlyDictionary<string, object?>? metadata = null,
+        bool? summarize = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrEmpty(filename))
@@ -2220,7 +2415,7 @@ public partial class AetherClient : IDisposable
         contentType ??= GuessContentType(filename);
         var query = AppendPartition(BuildQueryString(
             $"filename={Uri.EscapeDataString(filename)}&content_type={Uri.EscapeDataString(contentType)}",
-            tags, chunking, entityId, source, metadata));
+            tags, chunking, entityId, source, metadata, summarize: summarize));
         var content = new ByteArrayContent(data);
         return await RequestAsync<AsyncJobResult>(
             $"/documents/async?{query}", HttpMethod.Post, content, cancellationToken).ConfigureAwait(false);
@@ -2259,9 +2454,14 @@ public partial class AetherClient : IDisposable
     // ── Batch ─────────────────────────────────────────────────────────
 
     /// <summary>Insert multiple text documents in a single batch request.</summary>
+    /// <param name="documents">The documents to insert.</param>
+    /// <param name="chunking">Optional chunking config; server defaults when null.</param>
+    /// <param name="summarize">Batch-wide summary request (see <see cref="InsertAsync"/>); an item's own <see cref="BatchInsertItem.Summarize"/> overrides it. <c>null</c> (default) applies the tenant's default.</param>
+    /// <param name="cancellationToken">Cancellation token.</param>
     public async Task<List<DocumentRecord>> BatchInsertAsync(
         List<BatchInsertItem> documents,
         ChunkingConfig? chunking = null,
+        bool? summarize = null,
         CancellationToken cancellationToken = default)
     {
         if (documents is null || documents.Count == 0)
@@ -2286,10 +2486,11 @@ public partial class AetherClient : IDisposable
                     EntityId = item.EntityId,
                     Source = item.Source,
                     Metadata = item.Metadata,
+                    Summarize = item.Summarize,
                     Partition = _partition,
                 });
         }
-        var request = new BatchInsertRequest { Documents = items };
+        var request = new BatchInsertRequest { Documents = items, Summarize = summarize };
         if (chunking?.ChunkSize > 0)
             request.ChunkSize = chunking.ChunkSize;
         if (chunking?.Overlap > 0)

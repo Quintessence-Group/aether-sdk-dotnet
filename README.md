@@ -102,3 +102,134 @@ Binary-format parsing is handled automatically server-side — no setup required
 ## License
 
 MIT
+
+### Memory files
+
+Each entity can also keep named, versioned **markdown files** — for example a
+`memory.md` that an agent reads at the start of a session and keeps up to date. Read a
+file whole, one section at a time, or page by page; replace it whole under a version
+precondition, or edit it section by section; list its versions, diff them, and grep
+across files:
+
+```csharp
+var files = mem.Files;
+
+// Section-aware edits need no precondition: they apply to the current version.
+// A missing file or section is created.
+await files.AppendSectionAsync("memory.md", "Agreed terms", "- 2026-10-10 — Net 45 for EU entities");
+
+// Read the whole file, one section (heading text or slug), or just the outline.
+var file = await files.ReadAsync("memory.md");
+var terms = await files.ReadAsync("memory.md", section: "Agreed terms");
+foreach (var s in file.Sections)
+    Console.WriteLine($"{new string('#', s.Level)} {s.Heading} (lines {s.StartLine}-{s.EndLine})");
+
+// History: retained versions (newest first) and a unified diff.
+var history = await files.VersionsAsync("memory.md");
+var diff = await files.DiffAsync("memory.md"); // current vs. the previous version
+Console.WriteLine(diff.Diff);
+
+// Line-based search across this entity's files (literal by default; regex: true for patterns).
+var found = await files.GrepAsync("net 45", ignoreCase: true);
+foreach (var m in found.Matches)
+    Console.WriteLine($"{m.Name}:{m.Line} [{m.Section}] {m.Text}");
+
+// Soft delete (re-creating the name continues its versions), or hard delete for erasure.
+await files.DeleteAsync("scratch.md", hard: true);
+```
+
+**Read-modify-write.** To replace a file whole, read it, edit the content, and write it
+back with the version you read. If another writer got there first, the write fails with
+`VersionConflictException` (its `CurrentVersion` says what is there now); re-read and
+retry:
+
+```csharp
+while (true)
+{
+    var current = await files.ReadAsync("memory.md");
+    var edited = current.Content.Replace("Net 30", "Net 45");
+    try
+    {
+        await files.WriteAsync("memory.md", edited, expectedVersion: current.Version);
+        break;
+    }
+    catch (VersionConflictException)
+    {
+        // Someone else wrote first: loop to re-read and re-apply the edit.
+    }
+}
+
+// Create-only: fails with VersionConflictException if the file already exists.
+await files.WriteAsync("notes.md", "# Notes\n", create: true);
+```
+
+- `WriteAsync` and `ReplaceSectionAsync` take exactly one of `expectedVersion` or
+  `create: true`; passing neither or both throws `ArgumentException` before any request.
+  `AppendAsync` and `AppendSectionAsync` need no precondition (pass `expectedVersion`
+  to make them conditional too).
+- Every write sends an `Idempotency-Key` that the SDK reuses across its automatic retries
+  (pass `idempotencyKey:` to choose it), so a retried append is never applied twice.
+  Writing identical content is a no-op (`Unchanged`).
+- Names are 1–128 letters, digits, `.`, `_` or `-`, starting with a letter or digit;
+  `MemoryFiles.ValidateName` checks one up front.
+- A 404 `AetherApiException` with `ErrorCode == "feature_not_enabled"` means memory files
+  aren't enabled on your deployment.
+
+Across entities, the raw client lists and greps files by entity-id prefix — for example
+every company in one workspace:
+
+```csharp
+var page = await client.ListMemoryFilesAsync(entityPrefix: "ws_42:company:");
+var hits = await client.GrepMemoryFilesAsync("net 45", entityPrefix: "ws_42:company:", ignoreCase: true);
+```
+
+Search hits on a memory file carry `MemoryFile` (`Name`, `Version`, `Section`).
+
+### Reading a document's text
+
+`GetTextAsync` returns the parsed, readable text of any stored document — the
+original for text types, the caption or transcript for media, and text rebuilt
+from the parsed passages for PDF/Office — paged and addressable by section:
+
+```csharp
+var outline = await client.GetTextAsync(doc.DocId, outline: true);
+foreach (var s in outline.Sections!)
+    Console.WriteLine(s.Heading);
+
+var terms = await client.GetTextAsync(doc.DocId, section: "Payment terms");
+
+var page = await client.GetTextAsync(doc.DocId, maxBytes: 65536);
+while (page.Truncated)
+    page = await client.GetTextAsync(doc.DocId, offset: page.NextOffset, maxBytes: 65536);
+```
+
+### Document summaries
+
+Ask for a summary at ingest and the server generates it in the background once the
+document is stored — it never fails or delays the insert:
+
+```csharp
+var msa = await client.InsertAsync(File.ReadAllBytes("msa.pdf"), "msa.pdf", summarize: true);
+Console.WriteLine(msa.Summary); // "pending", or "skipped" by policy
+
+var summary = await client.GetSummaryAsync(msa.DocId);
+if (summary.State == "ready")
+    Console.WriteLine(summary.Content);
+
+// Queue a fresh one, or store your own (optionally only if it hasn't changed since you read it).
+await client.RegenerateSummaryAsync(msa.DocId);
+await client.PutSummaryAsync(msa.DocId, "## Summary\n- Our notes.\n", expectedRevision: summary.Revision);
+```
+
+- `summarize: null` (the default) applies your tenant's default; `true` or `false`
+  overrides it. It is accepted by `InsertAsync`, `InsertTextAsync`, `InsertStreamAsync`,
+  `EnqueueDocumentAsync` (the finished job reports `SummaryState`) and `BatchInsertAsync`
+  (batch-wide, plus a per-item `BatchInsertItem.Summarize`). On `Memory`, set
+  `MemoryOptions.Summarize` or pass `summarize:` to `RememberAsync`.
+- `State` is `none`, `pending`, `ready`, `failed`, `skipped` or `unsupported`.
+  `Content` shows the stored summary whatever the state, and `Stale` is true when the
+  document changed after its summary was written. If you asked for a summary and later
+  read `none`, the generation was interrupted: call `RegenerateSummaryAsync`.
+- A summary you wrote is kept until you replace it; `RegenerateSummaryAsync(docId, force: true)`
+  replaces it with a generated one.
+- A 404 `feature_not_enabled` means summaries aren't enabled on your deployment.
