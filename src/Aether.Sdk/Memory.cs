@@ -78,6 +78,15 @@ public class MemoryOptions : AetherClientOptions
     public bool ExtractFacts { get; set; }
 
     /// <summary>
+    /// Default summary request for this Memory's <see cref="Memory.RememberAsync"/>:
+    /// <c>true</c> asks the server to summarize each memory in the background after
+    /// it is stored, <c>false</c> opts out, and <c>null</c> (default) sends nothing so
+    /// the tenant's default applies. An explicit per-call <c>summarize:</c> argument
+    /// overrides this default.
+    /// </summary>
+    public bool? Summarize { get; set; }
+
+    /// <summary>
     /// Clock used for the deterministic recency algorithm. A dependency-free
     /// delegate returning "now"; defaults to <c>() =&gt; DateTimeOffset.UtcNow</c>.
     /// Override in tests for determinism. A plain delegate is used (not
@@ -118,11 +127,20 @@ public class Memory : IDisposable
     private readonly string _entityId;
     private readonly TimeSpan _halfLife;
     private readonly bool _extractFacts;
+    private readonly bool? _summarize;
     private readonly Func<DateTimeOffset> _clock;
     private bool _disposed;
 
     /// <summary>The entity ID every operation is scoped to. Fixed at construction.</summary>
     public string EntityId => _entityId;
+
+    /// <summary>
+    /// This entity's named, versioned markdown files (e.g. <c>memory.md</c>): read
+    /// whole, by section or by page; write under a version precondition or edit by
+    /// section; versions, diff, grep and delete. Scoped to <see cref="EntityId"/>
+    /// and the client's partition.
+    /// </summary>
+    public MemoryFiles Files { get; }
 
     /// <summary>
     /// Create an entity-scoped ordered conversation helper. Equivalent to
@@ -169,7 +187,9 @@ public class Memory : IDisposable
         _ownsClient = ownsClient;
         _halfLife = options?.HalfLife is { } hl && hl > TimeSpan.Zero ? hl : DefaultHalfLife;
         _extractFacts = options?.ExtractFacts ?? false;
+        _summarize = options?.Summarize;
         _clock = options?.Clock ?? (() => DateTimeOffset.UtcNow);
+        Files = new MemoryFiles(client, entityId);
     }
 
     private static void ValidateEntityId(string entityId)
@@ -197,12 +217,18 @@ public class Memory : IDisposable
     /// facts stored as sibling <c>kind:fact</c> memories; the returned item is
     /// still the raw memory. Requires fact extraction to be configured on the node.
     /// </param>
+    /// <param name="summarize">
+    /// Per-call override for a background summary of the memory. When <c>null</c>
+    /// (default), <see cref="MemoryOptions.Summarize"/> decides; when both are null
+    /// nothing is sent and the tenant's default applies.
+    /// </param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <returns>A <see cref="MemoryItem"/> built from the inserted document.</returns>
     public async Task<MemoryItem> RememberAsync(
         string text,
         IReadOnlyDictionary<string, object?>? metadata = null,
         bool? extract = null,
+        bool? summarize = null,
         CancellationToken cancellationToken = default)
     {
         if (string.IsNullOrWhiteSpace(text))
@@ -219,6 +245,7 @@ public class Memory : IDisposable
             entityId: _entityId,
             metadata: metadata,
             extractFacts: extract ?? _extractFacts,
+            summarize: summarize ?? _summarize,
             cancellationToken: cancellationToken).ConfigureAwait(false);
 
         return new MemoryItem
@@ -238,11 +265,12 @@ public class Memory : IDisposable
         string text,
         IReadOnlyDictionary<string, string>? metadata,
         bool? extract = null,
+        bool? summarize = null,
         CancellationToken cancellationToken = default)
     {
         IReadOnlyDictionary<string, object?>? typed = metadata?
             .ToDictionary(kv => kv.Key, kv => (object?)kv.Value);
-        return RememberAsync(text, typed, extract, cancellationToken);
+        return RememberAsync(text, typed, extract, summarize, cancellationToken);
     }
 
     /// <summary>
@@ -606,9 +634,12 @@ public class Memory : IDisposable
     /// <param name="limit">Maximum items. Default 50.</param>
     /// <param name="cancellationToken">Cancellation token.</param>
     /// <remarks>
-    /// Costs <b>1 + N</b> calls: one listing plus one content download per item
-    /// (the listing endpoint returns metadata, not text). Callers who need only
-    /// metadata can drop to the raw <c>client.ListAsync(entityId: ...)</c>.
+    /// Costs <b>1 + N</b> calls: one listing plus one content read per non-media
+    /// item (the listing endpoint returns metadata, not text). Text-like documents
+    /// are downloaded, other types (PDF, Office, …) are read through
+    /// <c>GetTextAsync</c>, and media memories use their caption/transcript.
+    /// Callers who need only metadata can drop to the raw
+    /// <c>client.ListAsync(entityId: ...)</c>.
     /// </remarks>
     public async Task<IReadOnlyList<MemoryItem>> ListAsync(
         string? since = null,
@@ -627,14 +658,14 @@ public class Memory : IDisposable
             records = records.GetRange(0, limit);
 
         // Media downloads are original binary assets; list uses the authorized
-        // indexed caption/transcript exposed as DerivedText instead.
-        var contentTasks = records.Select(async r =>
-        {
-            if (!string.IsNullOrEmpty(r.Modality) && r.DerivedText != null)
-                return r.DerivedText;
-            var payload = await _client.DownloadAsync(r.DocId, cancellationToken).ConfigureAwait(false);
-            return Encoding.UTF8.GetString(payload);
-        }).ToArray();
+        // indexed caption/transcript exposed as DerivedText instead. Other
+        // records are read by content type: text-like types are downloaded,
+        // anything else (PDF, Office, …) through GetTextAsync, falling back to "".
+        var contentTasks = records.Select(r =>
+            !string.IsNullOrEmpty(r.Modality) && r.DerivedText != null
+                ? Task.FromResult(r.DerivedText)
+                : _client.HydrateDocumentTextAsync(
+                    r.DocId, r.ContentType, r.DerivedText ?? "", cancellationToken)).ToArray();
         var texts = await Task.WhenAll(contentTasks).ConfigureAwait(false);
 
         var items = new List<MemoryItem>(records.Count);

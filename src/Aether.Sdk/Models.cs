@@ -69,6 +69,14 @@ public class DocumentRecord
     /// <summary>Indexed caption/transcript for a multimodal memory.</summary>
     [JsonPropertyName("derived_text")]
     public string? DerivedText { get; set; }
+
+    /// <summary>
+    /// Summary request outcome on an insert that asked for one: <c>pending</c>
+    /// (queued) or <c>skipped</c> (skipped by policy). Null when no summary was
+    /// requested. Read the summary itself with <see cref="AetherClient.GetSummaryAsync"/>.
+    /// </summary>
+    [JsonPropertyName("summary")]
+    public string? Summary { get; set; }
 }
 
 /// <summary>Result of storing an image or audio memory.</summary>
@@ -284,6 +292,11 @@ public class SearchResult
     /// <summary><c>image</c> or <c>audio</c> for a multimodal memory.</summary>
     [JsonPropertyName("modality")]
     public string? Modality { get; set; }
+
+    /// <summary>Which memory file (and section) the hit came from, when the matched
+    /// document is a memory file; null otherwise.</summary>
+    [JsonPropertyName("memory_file")]
+    public MemoryFileHit? MemoryFile { get; set; }
 }
 
 public class NodeStatus
@@ -330,6 +343,511 @@ public class ArchivePrice
     public ulong CacheTtlSeconds { get; set; }
 }
 
+/// <summary>
+/// One section of a markdown outline: a top-level ATX heading and the lines it
+/// spans. Line numbers are 1-based and inclusive; <see cref="Bytes"/> counts lines
+/// <see cref="StartLine"/>..<see cref="EndLine"/> including their line terminators.
+/// </summary>
+public class MemoryFileSection
+{
+    /// <summary>Heading text; empty for a bare <c>#</c>.</summary>
+    [JsonPropertyName("heading")]
+    public string Heading { get; set; } = "";
+
+    /// <summary>Heading level, 1–6.</summary>
+    [JsonPropertyName("level")]
+    public int Level { get; set; }
+
+    /// <summary>Slug, unique within the text — usable as a section selector.</summary>
+    [JsonPropertyName("slug")]
+    public string Slug { get; set; } = "";
+
+    [JsonPropertyName("start_line")]
+    public int StartLine { get; set; }
+
+    [JsonPropertyName("end_line")]
+    public int EndLine { get; set; }
+
+    [JsonPropertyName("bytes")]
+    public int Bytes { get; set; }
+}
+
+/// <summary>Result of <see cref="AetherClient.GetTextAsync"/> (<c>GET /v1/documents/{id}/text</c>).</summary>
+public class DocumentText
+{
+    [JsonPropertyName("doc_id")]
+    public string DocId { get; set; } = "";
+
+    [JsonPropertyName("content_type")]
+    public string ContentType { get; set; } = "";
+
+    /// <summary>
+    /// <c>original</c> (a text document's own bytes), <c>derived</c> (a media
+    /// memory's caption/transcript) or <c>passages</c> (rebuilt from a parsed
+    /// document's passages, best effort); <c>null</c> when <see cref="State"/> is
+    /// <c>unsupported</c>.
+    /// </summary>
+    [JsonPropertyName("source")]
+    public string? Source { get; set; }
+
+    /// <summary><c>ready</c>, or <c>unsupported</c> when the document has no readable text.</summary>
+    [JsonPropertyName("state")]
+    public string State { get; set; } = "ready";
+
+    /// <summary>This page of the selected text (empty with <c>outline: true</c>).</summary>
+    [JsonPropertyName("text")]
+    public string Text { get; set; } = "";
+
+    /// <summary>Byte offset of this page within the selected text.</summary>
+    [JsonPropertyName("offset")]
+    public int Offset { get; set; }
+
+    /// <summary>Offset of the next page, or <c>null</c> on the last page.</summary>
+    [JsonPropertyName("next_offset")]
+    public int? NextOffset { get; set; }
+
+    /// <summary>UTF-8 byte length of the selected text (the whole text, or the section).</summary>
+    [JsonPropertyName("total_bytes")]
+    public int TotalBytes { get; set; }
+
+    /// <summary>Whether more pages follow (<see cref="NextOffset"/> is not null).</summary>
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; set; }
+
+    /// <summary>The selected section when a section was requested.</summary>
+    [JsonPropertyName("section")]
+    public MemoryFileSection? Section { get; set; }
+
+    /// <summary>The text's outline when <c>outline: true</c> was requested.</summary>
+    [JsonPropertyName("sections")]
+    public List<MemoryFileSection>? Sections { get; set; }
+}
+
+// ── Memory files ─────────────────────────────────────────────────────────
+//
+// Named, versioned markdown files per entity (Memory.Files). Field names are the
+// wire names; timestamps are RFC 3339 strings, left unparsed.
+
+/// <summary>
+/// One memory-file version's metadata: a list item of
+/// <see cref="MemoryFiles.ListAsync"/> / <see cref="AetherClient.ListMemoryFilesAsync"/>,
+/// and the base of every read and write result.
+/// </summary>
+public class MemoryFileInfo
+{
+    /// <summary>The entity that owns the file.</summary>
+    [JsonPropertyName("entity_id")]
+    public string EntityId { get; set; } = "";
+
+    /// <summary>The file's partition, or null for the default partition.</summary>
+    [JsonPropertyName("partition")]
+    public string? Partition { get; set; }
+
+    /// <summary>The file name (case-sensitive), e.g. <c>memory.md</c>.</summary>
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    /// <summary>Stable file identity, kept across a soft delete and re-create.</summary>
+    [JsonPropertyName("file_id")]
+    public string FileId { get; set; } = "";
+
+    /// <summary>The document holding this version.</summary>
+    [JsonPropertyName("doc_id")]
+    public string DocId { get; set; } = "";
+
+    /// <summary>
+    /// The file version, 1 and up; pass it back as <c>expectedVersion</c> for a
+    /// conditional write. Not the same as <see cref="DocumentRecord.Version"/>.
+    /// </summary>
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    /// <summary>Size of this version's content in bytes.</summary>
+    [JsonPropertyName("bytes")]
+    public int Bytes { get; set; }
+
+    /// <summary>Hash of this version's content.</summary>
+    [JsonPropertyName("content_hash")]
+    public string ContentHash { get; set; } = "";
+
+    /// <summary>The free-text author label given on the write, if any.</summary>
+    [JsonPropertyName("author")]
+    public string? Author { get; set; }
+
+    /// <summary>The authenticated principal that wrote this version.</summary>
+    [JsonPropertyName("principal")]
+    public string Principal { get; set; } = "";
+
+    /// <summary>The write that produced this version: <c>put</c>, <c>append</c>, <c>append_section</c> or <c>replace_section</c>.</summary>
+    [JsonPropertyName("op")]
+    public string Op { get; set; } = "";
+
+    /// <summary>When the file was created (RFC 3339).</summary>
+    [JsonPropertyName("created_at")]
+    public string CreatedAt { get; set; } = "";
+
+    /// <summary>When this version was written (RFC 3339).</summary>
+    [JsonPropertyName("updated_at")]
+    public string UpdatedAt { get; set; } = "";
+}
+
+/// <summary>Result of <see cref="MemoryFiles.ReadAsync"/>: one page of a memory-file version.</summary>
+public class MemoryFile : MemoryFileInfo
+{
+    /// <summary><c>false</c> when an older version was requested.</summary>
+    [JsonPropertyName("is_current")]
+    public bool IsCurrent { get; set; }
+
+    /// <summary>This page of the selected text (the whole file, or one section); empty for an outline read.</summary>
+    [JsonPropertyName("content")]
+    public string Content { get; set; } = "";
+
+    /// <summary>The selected section when a section was requested.</summary>
+    [JsonPropertyName("section")]
+    public MemoryFileSection? Section { get; set; }
+
+    /// <summary>Byte offset of this page within the selected text.</summary>
+    [JsonPropertyName("offset")]
+    public int Offset { get; set; }
+
+    /// <summary>Offset of the next page, or <c>null</c> on the last page.</summary>
+    [JsonPropertyName("next_offset")]
+    public int? NextOffset { get; set; }
+
+    /// <summary>UTF-8 byte length of the selected text (the whole version, or the section).</summary>
+    [JsonPropertyName("total_bytes")]
+    public int TotalBytes { get; set; }
+
+    /// <summary>Whether more pages follow (<see cref="NextOffset"/> is not null).</summary>
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; set; }
+
+    /// <summary>The whole version's outline, with whole-file line numbers.</summary>
+    [JsonPropertyName("sections")]
+    public List<MemoryFileSection> Sections { get; set; } = new();
+}
+
+/// <summary>Result of a memory-file write (<c>WriteAsync</c>, <c>AppendAsync</c>, <c>AppendSectionAsync</c>, <c>ReplaceSectionAsync</c>).</summary>
+/// <remarks>The inherited fields describe the resulting current version.</remarks>
+public class MemoryFileWriteResult : MemoryFileInfo
+{
+    /// <summary>
+    /// <c>true</c> when the write would not change the content, so nothing was
+    /// written; the fields then describe the existing current version.
+    /// </summary>
+    [JsonPropertyName("unchanged")]
+    public bool Unchanged { get; set; }
+
+    /// <summary>The version this write replaced; <c>null</c> when it created the file.</summary>
+    [JsonPropertyName("previous_version")]
+    public int? PreviousVersion { get; set; }
+
+    /// <summary><c>true</c> when this write created the file.</summary>
+    [JsonPropertyName("file_created")]
+    public bool FileCreated { get; set; }
+
+    /// <summary>For section edits: the affected section after the write; otherwise null.</summary>
+    [JsonPropertyName("section")]
+    public MemoryFileSection? Section { get; set; }
+
+    /// <summary>For section edits: <c>true</c> when the section did not exist and was created.</summary>
+    [JsonPropertyName("section_created")]
+    public bool SectionCreated { get; set; }
+
+    /// <summary>Outline of the resulting content.</summary>
+    [JsonPropertyName("sections")]
+    public List<MemoryFileSection> Sections { get; set; } = new();
+}
+
+/// <summary>One retained version in <see cref="MemoryFileVersions"/>.</summary>
+public class MemoryFileVersion
+{
+    [JsonPropertyName("doc_id")]
+    public string DocId { get; set; } = "";
+
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    [JsonPropertyName("bytes")]
+    public int Bytes { get; set; }
+
+    [JsonPropertyName("content_hash")]
+    public string ContentHash { get; set; } = "";
+
+    [JsonPropertyName("author")]
+    public string? Author { get; set; }
+
+    [JsonPropertyName("principal")]
+    public string Principal { get; set; } = "";
+
+    /// <summary><c>put</c>, <c>append</c>, <c>append_section</c> or <c>replace_section</c>.</summary>
+    [JsonPropertyName("op")]
+    public string Op { get; set; } = "";
+
+    [JsonPropertyName("updated_at")]
+    public string UpdatedAt { get; set; } = "";
+
+    /// <summary>Whether this is the file's current version.</summary>
+    [JsonPropertyName("is_current")]
+    public bool IsCurrent { get; set; }
+}
+
+/// <summary>Result of <see cref="MemoryFiles.VersionsAsync"/>: a file's retained versions, newest first.</summary>
+public class MemoryFileVersions
+{
+    [JsonPropertyName("entity_id")]
+    public string EntityId { get; set; } = "";
+
+    [JsonPropertyName("partition")]
+    public string? Partition { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("file_id")]
+    public string FileId { get; set; } = "";
+
+    [JsonPropertyName("current_version")]
+    public int CurrentVersion { get; set; }
+
+    [JsonPropertyName("versions")]
+    public List<MemoryFileVersion> Versions { get; set; } = new();
+}
+
+/// <summary>Result of <see cref="MemoryFiles.DiffAsync"/>: a line-based unified diff between two versions.</summary>
+public class MemoryFileDiff
+{
+    [JsonPropertyName("entity_id")]
+    public string EntityId { get; set; } = "";
+
+    [JsonPropertyName("partition")]
+    public string? Partition { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("file_id")]
+    public string FileId { get; set; } = "";
+
+    /// <summary>The older side; <c>0</c> denotes the empty file.</summary>
+    [JsonPropertyName("from_version")]
+    public int FromVersion { get; set; }
+
+    [JsonPropertyName("to_version")]
+    public int ToVersion { get; set; }
+
+    /// <summary>Unchanged context lines around each change.</summary>
+    [JsonPropertyName("context")]
+    public int Context { get; set; }
+
+    /// <summary>The unified diff text (<c>--- name@vN</c> / <c>+++ name@vM</c> headers, then hunks).</summary>
+    [JsonPropertyName("diff")]
+    public string Diff { get; set; } = "";
+
+    [JsonPropertyName("added_lines")]
+    public int AddedLines { get; set; }
+
+    [JsonPropertyName("removed_lines")]
+    public int RemovedLines { get; set; }
+
+    /// <summary><c>true</c> when the diff is correct but may not be minimal (the server's time budget ran out).</summary>
+    [JsonPropertyName("approximate")]
+    public bool Approximate { get; set; }
+
+    /// <summary><c>true</c> when the diff output was cut at the server's size cap.</summary>
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; set; }
+}
+
+/// <summary>A page of memory files from <see cref="MemoryFiles.ListAsync"/> / <see cref="AetherClient.ListMemoryFilesAsync"/>.</summary>
+public class MemoryFilePage
+{
+    /// <summary>Current versions of live files, ordered by partition, entity and name.</summary>
+    [JsonPropertyName("files")]
+    public List<MemoryFileInfo> Files { get; set; } = new();
+
+    /// <summary>Pass back as <c>cursor</c> for the next page; <c>null</c> on the last page.</summary>
+    [JsonPropertyName("next_cursor")]
+    public string? NextCursor { get; set; }
+}
+
+/// <summary>One matching line in a <see cref="MemoryGrepResult"/>.</summary>
+public class MemoryGrepMatch
+{
+    [JsonPropertyName("entity_id")]
+    public string EntityId { get; set; } = "";
+
+    [JsonPropertyName("partition")]
+    public string? Partition { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    /// <summary>The (current) version that was scanned.</summary>
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    /// <summary>1-based line number of the match.</summary>
+    [JsonPropertyName("line")]
+    public int Line { get; set; }
+
+    /// <summary>Heading of the innermost section containing the line; null before the first heading.</summary>
+    [JsonPropertyName("section")]
+    public string? Section { get; set; }
+
+    /// <summary>Slug of that section; null before the first heading.</summary>
+    [JsonPropertyName("section_slug")]
+    public string? SectionSlug { get; set; }
+
+    /// <summary>The matching line, without its line terminator.</summary>
+    [JsonPropertyName("text")]
+    public string Text { get; set; } = "";
+
+    /// <summary>Context lines before the match.</summary>
+    [JsonPropertyName("before")]
+    public List<string> Before { get; set; } = new();
+
+    /// <summary>Context lines after the match.</summary>
+    [JsonPropertyName("after")]
+    public List<string> After { get; set; } = new();
+}
+
+/// <summary>Result of <see cref="MemoryFiles.GrepAsync"/> / <see cref="AetherClient.GrepMemoryFilesAsync"/>.</summary>
+public class MemoryGrepResult
+{
+    [JsonPropertyName("matches")]
+    public List<MemoryGrepMatch> Matches { get; set; } = new();
+
+    /// <summary><c>true</c> when the scan stopped at a cap before covering everything.</summary>
+    [JsonPropertyName("truncated")]
+    public bool Truncated { get; set; }
+
+    /// <summary>Which cap stopped the scan: <c>max_matches</c>, <c>max_files</c>, <c>max_bytes</c> or <c>deadline</c>; null when not truncated.</summary>
+    [JsonPropertyName("truncated_reason")]
+    public string? TruncatedReason { get; set; }
+
+    [JsonPropertyName("files_scanned")]
+    public int FilesScanned { get; set; }
+
+    [JsonPropertyName("bytes_scanned")]
+    public int BytesScanned { get; set; }
+}
+
+/// <summary>Result of <see cref="MemoryFiles.DeleteAsync"/>.</summary>
+public class MemoryFileDeleteResult
+{
+    [JsonPropertyName("entity_id")]
+    public string EntityId { get; set; } = "";
+
+    [JsonPropertyName("partition")]
+    public string? Partition { get; set; }
+
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("file_id")]
+    public string FileId { get; set; } = "";
+
+    /// <summary>The version that was current when the file was deleted.</summary>
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    /// <summary>Whether every version was purged irreversibly.</summary>
+    [JsonPropertyName("hard")]
+    public bool Hard { get; set; }
+
+    /// <summary><c>1</c> for a soft delete; the number of versions purged for a hard delete.</summary>
+    [JsonPropertyName("versions_deleted")]
+    public int VersionsDeleted { get; set; }
+}
+
+/// <summary>
+/// Where a search hit came from when the matched document is a memory file
+/// (<see cref="SearchResult.MemoryFile"/>).
+/// </summary>
+public class MemoryFileHit
+{
+    [JsonPropertyName("name")]
+    public string Name { get; set; } = "";
+
+    [JsonPropertyName("version")]
+    public int Version { get; set; }
+
+    /// <summary>Heading of the section containing the matched passage, best effort; may be null.</summary>
+    [JsonPropertyName("section")]
+    public string? Section { get; set; }
+
+    [JsonPropertyName("section_slug")]
+    public string? SectionSlug { get; set; }
+}
+
+// ── Document summaries ───────────────────────────────────────────────────
+
+/// <summary>
+/// A document's summary and its state (<see cref="AetherClient.GetSummaryAsync"/>,
+/// <see cref="AetherClient.PutSummaryAsync"/>, <see cref="AetherClient.RegenerateSummaryAsync"/>).
+/// </summary>
+public class DocumentSummary
+{
+    /// <summary>The summarized document.</summary>
+    [JsonPropertyName("doc_id")]
+    public string DocId { get; set; } = "";
+
+    /// <summary>
+    /// <c>none</c>, <c>pending</c>, <c>ready</c>, <c>failed</c>, <c>skipped</c> or
+    /// <c>unsupported</c>. A caller that requested a summary and later reads
+    /// <c>none</c> should treat it as interrupted and regenerate.
+    /// </summary>
+    [JsonPropertyName("state")]
+    public string State { get; set; } = "none";
+
+    /// <summary>Machine reason for <c>skipped</c>, <c>unsupported</c> or <c>failed</c>.</summary>
+    [JsonPropertyName("reason")]
+    public string? Reason { get; set; }
+
+    /// <summary>Human-readable message for <c>failed</c>.</summary>
+    [JsonPropertyName("error")]
+    public string? Error { get; set; }
+
+    /// <summary>The document storing the summary, if any.</summary>
+    [JsonPropertyName("summary_doc_id")]
+    public string? SummaryDocId { get; set; }
+
+    /// <summary>The stored summary markdown, if any. Independent of <see cref="State"/>.</summary>
+    [JsonPropertyName("content")]
+    public string? Content { get; set; }
+
+    /// <summary>Opaque revision of the stored summary; pass it as <c>expectedRevision</c> to <see cref="AetherClient.PutSummaryAsync"/>. Compare only for equality.</summary>
+    [JsonPropertyName("revision")]
+    public string? Revision { get; set; }
+
+    /// <summary><c>aether</c> (generated) or <c>user</c> (written with <see cref="AetherClient.PutSummaryAsync"/>).</summary>
+    [JsonPropertyName("authored_by")]
+    public string? AuthoredBy { get; set; }
+
+    [JsonPropertyName("generator")]
+    public string? Generator { get; set; }
+
+    [JsonPropertyName("prompt_version")]
+    public string? PromptVersion { get; set; }
+
+    /// <summary>When the stored summary was written (RFC 3339).</summary>
+    [JsonPropertyName("generated_at")]
+    public string? GeneratedAt { get; set; }
+
+    /// <summary>The document content id the summary was written against.</summary>
+    [JsonPropertyName("source_cid")]
+    public string? SourceCid { get; set; }
+
+    /// <summary><c>true</c> when a summary is stored but the document has changed since.</summary>
+    [JsonPropertyName("stale")]
+    public bool Stale { get; set; }
+
+    /// <summary><c>true</c> when the document was too long and only its outline and opening were summarized.</summary>
+    [JsonPropertyName("truncated_input")]
+    public bool TruncatedInput { get; set; }
+}
+
 /// <summary>Extends SearchResult with full document content for RAG workflows.</summary>
 public class RetrievalResult
 {
@@ -340,7 +858,12 @@ public class RetrievalResult
     [JsonPropertyName("score")]
     public int Score { get; set; }
 
-    /// <summary>Full document content as text, for use in RAG prompts.</summary>
+    /// <summary>
+    /// The document's text, for use in RAG prompts. Text-like documents are
+    /// downloaded and decoded; other types (PDF, Office, HTML, CSV, …) are read
+    /// through <see cref="AetherClient.GetTextAsync"/>, falling back to the
+    /// matched <see cref="Passage"/>; media hits use their caption/transcript.
+    /// </summary>
     [JsonPropertyName("content")]
     public string Content { get; set; } = "";
 
@@ -395,6 +918,11 @@ public class RetrievalResult
     /// <summary><c>image</c> or <c>audio</c> for a multimodal memory.</summary>
     [JsonPropertyName("modality")]
     public string? Modality { get; set; }
+
+    /// <summary>Which memory file (and section) the hit came from, when the matched
+    /// document is a memory file; null otherwise. See <see cref="SearchResult.MemoryFile"/>.</summary>
+    [JsonPropertyName("memory_file")]
+    public MemoryFileHit? MemoryFile { get; set; }
 }
 
 /// <summary>A text passage with its precomputed embedding vector.</summary>
@@ -495,6 +1023,14 @@ public class BatchInsertItem
     [JsonPropertyName("metadata")]
     [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
     public Dictionary<string, object?>? Metadata { get; set; }
+
+    /// <summary>
+    /// Per-item summary request, overriding the batch-wide <c>summarize</c> of
+    /// <see cref="AetherClient.BatchInsertAsync"/>; omitted from the wire when null.
+    /// </summary>
+    [JsonPropertyName("summarize")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Summarize { get; set; }
 
     /// <summary>
     /// Partition this item is scoped to. Set automatically by a partition handle
@@ -649,6 +1185,14 @@ public class JobStatus
 
     [JsonPropertyName("error")]
     public string? Error { get; set; }
+
+    /// <summary>
+    /// Set when the job completes and a summary was requested: <c>pending</c>
+    /// (queued) or <c>skipped</c>. Null otherwise. Poll
+    /// <see cref="AetherClient.GetSummaryAsync"/> for the outcome.
+    /// </summary>
+    [JsonPropertyName("summary_state")]
+    public string? SummaryState { get; set; }
 }
 
 /// <summary>Tallies returned by <see cref="AetherClient.BackfillEntityFromTagsAsync"/>,
@@ -988,6 +1532,10 @@ internal class BatchInsertRequest
 
     [JsonPropertyName("overlap")]
     public int? Overlap { get; set; }
+
+    [JsonPropertyName("summarize")]
+    [JsonIgnore(Condition = JsonIgnoreCondition.WhenWritingNull)]
+    public bool? Summarize { get; set; }
 }
 
 internal class BatchInsertResponse
@@ -1071,6 +1619,20 @@ internal class ErrorResponse
 
     [JsonPropertyName("code")]
     public string? Code { get; set; }
+
+    // Context field of a memory-file version conflict. Kept as a raw element so
+    // an unexpected shape (string, fraction, object) degrades to null instead of
+    // failing the whole error parse.
+    [JsonPropertyName("current_version")]
+    public System.Text.Json.JsonElement? CurrentVersion { get; set; }
+
+    /// <summary><c>current_version</c> as an integer; null when missing, null or not an integer.</summary>
+    [JsonIgnore]
+    public int? CurrentVersionValue =>
+        CurrentVersion is { ValueKind: System.Text.Json.JsonValueKind.Number } element
+            && element.TryGetInt32(out var version)
+            ? version
+            : null;
 }
 
 // ── Memory graph result types ────────────────────────────────────────────

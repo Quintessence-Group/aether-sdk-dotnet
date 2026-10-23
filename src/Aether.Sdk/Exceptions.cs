@@ -48,7 +48,16 @@ public class AetherApiException : AetherException
     /// (Phase 8 / ADR-015 wire shape); unknown codes fall back to the base
     /// <see cref="AetherApiException"/>.
     /// </summary>
-    public static AetherApiException FromResponse(HttpStatusCode statusCode, string body, string? errorCode)
+    public static AetherApiException FromResponse(HttpStatusCode statusCode, string body, string? errorCode) =>
+        FromResponse(statusCode, body, errorCode, currentVersion: null);
+
+    /// <summary>
+    /// Same as <see cref="FromResponse(HttpStatusCode, string, string?)"/>, also
+    /// carrying the <c>current_version</c> field of a memory-file version conflict
+    /// onto <see cref="VersionConflictException.CurrentVersion"/>.
+    /// </summary>
+    internal static AetherApiException FromResponse(
+        HttpStatusCode statusCode, string body, string? errorCode, int? currentVersion)
     {
         var status = (int)statusCode;
         return (status, errorCode) switch
@@ -59,8 +68,34 @@ public class AetherApiException : AetherException
             (400, "partition_required") => new PartitionRequiredException(statusCode, body, errorCode),
             (400, "session_invalid") => new SessionInvalidException(statusCode, body, errorCode),
             (400, "partition_mismatch") => new PartitionMismatchException(statusCode, body, errorCode),
+            (412, "memory_file_version_conflict") =>
+                new VersionConflictException(statusCode, body, errorCode, currentVersion),
             _ => new AetherApiException(statusCode, body, errorCode),
         };
+    }
+}
+
+/// <summary>
+/// Thrown when a conditional memory-file write or delete fails its version
+/// precondition (HTTP 412, <c>code = "memory_file_version_conflict"</c>): the
+/// expected version is no longer the file's current version, the file does not
+/// exist, or a create-only write found an existing file. Re-read the file
+/// (<see cref="MemoryFiles.ReadAsync"/>), re-apply the edit and write again with
+/// the new version. Not retryable as-is.
+/// </summary>
+public class VersionConflictException : AetherApiException
+{
+    /// <summary>
+    /// The file's current version as reported by the server, or <c>null</c> when
+    /// no live file exists (or the server did not report one).
+    /// </summary>
+    public int? CurrentVersion { get; }
+
+    public VersionConflictException(
+        HttpStatusCode statusCode, string body, string? errorCode = null, int? currentVersion = null)
+        : base(statusCode, body, errorCode)
+    {
+        CurrentVersion = currentVersion;
     }
 }
 

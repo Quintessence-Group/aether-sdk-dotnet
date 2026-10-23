@@ -13,7 +13,7 @@
          `AetherDb.Sdk.SemanticKernel` while the assembly + namespace stay
          `Aether.Sdk.SemanticKernel` (consumers write `using Aether.Sdk.SemanticKernel;`). -->
     <PackageId>AetherDb.Sdk.SemanticKernel</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.7.0</Version>
     <Authors>Aether Contributors</Authors>
     <Description>Semantic Kernel agent-memory provider backed by the Aether .NET SDK. Gives a Semantic Kernel agent durable, entity-scoped memory that persists across sessions.</Description>
     <PackageLicenseExpression>MIT</PackageLicenseExpression>
