@@ -534,7 +534,7 @@ public partial class AetherClient : IDisposable
             errorCode = errorObj?.Code;
             currentVersion = errorObj?.CurrentVersionValue;
         }
-        catch
+        catch (JsonException)
         {
             errorMessage = response.ReasonPhrase ?? "Unknown error";
         }
@@ -635,6 +635,8 @@ public partial class AetherClient : IDisposable
                 $"Failed to connect to {_baseUrl}: {ex.Message}", ex);
         }
 
+        using var responseLifetime = response;
+
         if (!response.IsSuccessStatusCode)
             throw await BuildApiExceptionAsync(response, cancellationToken).ConfigureAwait(false);
 
@@ -684,6 +686,8 @@ public partial class AetherClient : IDisposable
                 $"Failed to connect to {_baseUrl}: {ex.Message}", ex);
         }
 
+        using var responseLifetime = response;
+
         if (!response.IsSuccessStatusCode)
             throw await BuildApiExceptionAsync(response, cancellationToken).ConfigureAwait(false);
     }
@@ -711,6 +715,8 @@ public partial class AetherClient : IDisposable
             throw new AetherNetworkException(
                 $"Failed to connect to {_baseUrl}: {ex.Message}", ex);
         }
+
+        using var responseLifetime = response;
 
         if (!response.IsSuccessStatusCode)
             throw await BuildApiExceptionAsync(response, cancellationToken).ConfigureAwait(false);
@@ -881,6 +887,8 @@ public partial class AetherClient : IDisposable
             throw new AetherNetworkException(
                 $"Failed to connect to {_baseUrl}: {ex.Message}", ex);
         }
+
+        using var responseLifetime = response;
 
         if (!response.IsSuccessStatusCode)
             throw await BuildApiExceptionAsync(response, cancellationToken).ConfigureAwait(false);
