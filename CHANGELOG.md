@@ -15,6 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Dispose HTTP responses after successful reads, API errors, and deserialization failures; malformed error bodies retain their HTTP error fallback.
 - Retrieve readable text for PDF and Office documents instead of decoding their original binary bytes.
 
 
