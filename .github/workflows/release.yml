@@ -18,6 +18,11 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Existing v<version> tag to publish or verify"
+        type: string
+        required: true
 
 permissions:
   contents: read
@@ -27,11 +32,16 @@ jobs:
     name: Build, test & publish to NuGet
     runs-on: ubuntu-latest
     environment: prod
+    timeout-minutes: 75
+    env:
+      RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
     permissions:
       contents: read
       id-token: write # required for the NuGet Trusted Publishing OIDC exchange
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
 
       - name: Setup .NET
         uses: actions/setup-dotnet@v5
@@ -45,11 +55,12 @@ jobs:
         run: dotnet test -c Release --no-build
 
       - name: Verify release tag matches package version
-        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           version=$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' src/Aether.Sdk/Aether.Sdk.csproj)
-          test "${GITHUB_REF_NAME#v}" = "$version"
+          [[ "$RELEASE_TAG" == v* ]] || { echo "::error::Select an existing v<version> release tag"; exit 1; }
+          test "$(git rev-parse --verify "refs/tags/${RELEASE_TAG}^{commit}")" = "$(git rev-parse HEAD)"
+          test "${RELEASE_TAG#v}" = "$version"
 
       - name: Pack
         run: |
@@ -69,13 +80,23 @@ jobs:
           --source https://api.nuget.org/v3/index.json
           --skip-duplicate
 
-      - name: Verify published core package can be restored
+      - name: Verify published core and Semantic Kernel packages
         shell: bash
         run: |
           version=$(sed -n 's/.*<Version>\([^<]*\)<\/Version>.*/\1/p' src/Aether.Sdk/Aether.Sdk.csproj)
-          dotnet new console -o "$RUNNER_TEMP/sdk-smoke" --framework net8.0
-          for attempt in 1 2 3 4 5; do
-            dotnet add "$RUNNER_TEMP/sdk-smoke" package AetherDb.Sdk --version "$version" && exit 0
-            sleep 20
+          dotnet new console -o "$RUNNER_TEMP/sdk-smoke" --framework net8.0 --no-restore
+          dotnet add "$RUNNER_TEMP/sdk-smoke" package AetherDb.Sdk --version "$version" --no-restore
+          dotnet add "$RUNNER_TEMP/sdk-smoke" package AetherDb.Sdk.SemanticKernel --version "$version" --no-restore
+          # NuGet validation and indexing can take up to an hour. Avoid cached
+          # pre-publication metadata and verify both packages in an isolated cache.
+          for attempt in $(seq 1 120); do
+            if dotnet restore "$RUNNER_TEMP/sdk-smoke" --force --no-cache \
+              --packages "$RUNNER_TEMP/nuget-release-verify" \
+              --source https://api.nuget.org/v3/index.json; then
+              dotnet build "$RUNNER_TEMP/sdk-smoke" --no-restore
+              exit 0
+            fi
+            echo "Waiting for NuGet validation/indexing (attempt $attempt/120)."
+            [ "$attempt" = "120" ] && exit 1
+            sleep 30
           done
-          exit 1
